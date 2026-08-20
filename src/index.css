@@ -1,0 +1,130 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  color-scheme: light;
+  --background: oklch(0.975 0.009 85);
+  --foreground: oklch(0.205 0.012 60);
+  --card: oklch(0.995 0.004 85);
+  --card-foreground: oklch(0.205 0.012 60);
+  --popover: oklch(0.995 0.004 85);
+  --popover-foreground: oklch(0.205 0.012 60);
+  --primary: oklch(0.22 0.012 55);
+  --primary-foreground: oklch(0.985 0.006 85);
+  --secondary: oklch(0.935 0.012 82);
+  --secondary-foreground: oklch(0.275 0.012 60);
+  --muted: oklch(0.945 0.009 82);
+  --muted-foreground: oklch(0.49 0.016 65);
+  --accent: oklch(0.91 0.075 75);
+  --accent-foreground: oklch(0.285 0.05 60);
+  --breadcrumb: oklch(0.72 0.16 67);
+  --breadcrumb-soft: oklch(0.93 0.06 75);
+  --destructive: oklch(0.59 0.22 27);
+  --border: oklch(0.885 0.014 80);
+  --input: oklch(0.885 0.014 80);
+  --ring: oklch(0.72 0.16 67);
+  --radius: 0.75rem;
+  --sidebar: oklch(0.955 0.012 82);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-accent: var(--accent);
+  --sidebar-accent-foreground: var(--accent-foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
+}
+
+.dark {
+  color-scheme: dark;
+  --background: oklch(0.165 0.009 60);
+  --foreground: oklch(0.94 0.009 82);
+  --card: oklch(0.205 0.01 60);
+  --card-foreground: oklch(0.94 0.009 82);
+  --popover: oklch(0.225 0.012 60);
+  --popover-foreground: oklch(0.94 0.009 82);
+  --primary: oklch(0.91 0.012 80);
+  --primary-foreground: oklch(0.19 0.01 60);
+  --secondary: oklch(0.27 0.012 60);
+  --secondary-foreground: oklch(0.93 0.009 82);
+  --muted: oklch(0.255 0.011 60);
+  --muted-foreground: oklch(0.69 0.012 75);
+  --accent: oklch(0.32 0.055 67);
+  --accent-foreground: oklch(0.92 0.075 75);
+  --breadcrumb: oklch(0.77 0.145 69);
+  --breadcrumb-soft: oklch(0.31 0.055 67);
+  --destructive: oklch(0.67 0.2 25);
+  --border: oklch(0.31 0.012 60);
+  --input: oklch(0.31 0.012 60);
+  --ring: oklch(0.77 0.145 69);
+  --sidebar: oklch(0.185 0.009 60);
+}
+
+@theme inline {
+  --font-sans: "Geist Variable", "Segoe UI Variable", "Segoe UI", sans-serif;
+  --font-mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-breadcrumb: var(--breadcrumb);
+  --color-breadcrumb-soft: var(--breadcrumb-soft);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --radius-sm: calc(var(--radius) * .65);
+  --radius-md: calc(var(--radius) * .82);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.35);
+  --radius-2xl: calc(var(--radius) * 1.75);
+  --radius-3xl: calc(var(--radius) * 2.2);
+}
+
+@layer base {
+  * { @apply border-border outline-ring/50; }
+  html, body, #root { min-height: 100%; }
+  body { @apply m-0 bg-background text-foreground antialiased; }
+  button, input, textarea { font: inherit; }
+  ::selection { background: color-mix(in oklab, var(--breadcrumb) 28%, transparent); }
+}
+
+html[data-surface="hud"], html[data-surface="hud"] body, html[data-surface="hud"] #root,
+html[data-surface="region"], html[data-surface="region"] body, html[data-surface="region"] #root {
+  background: transparent !important;
+  overflow: hidden;
+}
+
+.app-noise {
+  background-image: radial-gradient(color-mix(in oklab, var(--foreground) 10%, transparent) .55px, transparent .55px);
+  background-size: 12px 12px;
+}
+.crumb-shadow { box-shadow: 0 1px 1px color-mix(in oklab, var(--foreground) 6%, transparent), 0 16px 42px color-mix(in oklab, var(--foreground) 8%, transparent); }
+.canvas-grid {
+  background-color: color-mix(in oklab, var(--muted) 65%, var(--background));
+  background-image: linear-gradient(color-mix(in oklab, var(--border) 68%, transparent) 1px, transparent 1px), linear-gradient(90deg, color-mix(in oklab, var(--border) 68%, transparent) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+.drag-region { -webkit-app-region: drag; }
+.no-drag { -webkit-app-region: no-drag; }
