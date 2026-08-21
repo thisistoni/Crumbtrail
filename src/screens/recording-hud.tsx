@@ -7,6 +7,7 @@ import { Separator } from "@/components/ui/separator"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { bridge } from "@/lib/bridge"
 import { useLocale } from "@/lib/i18n"
+import { whenNativeWindowReady } from "@/lib/native-window"
 import { shortcutLabel, useSettings } from "@/lib/settings"
 import type { RecordingStateSnapshot } from "@/types"
 
@@ -17,7 +18,11 @@ export function RecordingHud() {
   const [localStart] = useState(Date.now())
 
   useEffect(() => {
-    bridge.protectWindow()
+    const hud = getCurrentWindow()
+    void (async () => {
+      await whenNativeWindowReady(() => bridge.protectWindow())
+      await whenNativeWindowReady(() => hud.show())
+    })().catch(() => undefined)
     const unlisteners: (() => void)[] = []
     bridge.recordingState().then(setState)
     bridge.on<RecordingStateSnapshot>("recording://state", next => { setState(next); if (next.status === "idle") void getCurrentWindow().close() }).then(stop => unlisteners.push(stop))

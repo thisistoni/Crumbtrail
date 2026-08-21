@@ -14,12 +14,14 @@ src-tauri/target
 src-tauri/gen
 .localappdata
 .pnpm-store
+tmp
 **/bin
 **/obj
 *.local
 
 # Local outputs and signing material
 artifacts
+output
 *.pfx
 *.p12
 

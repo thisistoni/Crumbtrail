@@ -13,6 +13,7 @@ import { Switch } from "@/components/ui/switch"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { bridge, isTauri } from "@/lib/bridge"
 import { useLocale } from "@/lib/i18n"
+import { whenNativeWindowReady } from "@/lib/native-window"
 import { functionKeyCode, shortcutLabel, useSettings } from "@/lib/settings"
 import type { CaptureTargetDescriptor, CaptureTargetKind, PixelRect, ProjectManifest, RecordingOptions } from "@/types"
 
@@ -105,9 +106,9 @@ export function RecordingSetup({ project, onBack, onProject, onStarted }: SetupP
     try {
       const updated = await bridge.autosave({ ...project, capture: options })
       onProject(updated)
-      await bridge.startRecording(project.id, options, region)
+      const snapshot = await bridge.startRecording(project.id, options, region)
       recorderStarted = true
-      await openHud()
+      await Promise.allSettled([openRecordingOverlay(snapshot.target), openHud()])
       onStarted()
     } catch (error) {
       if (recorderStarted) await bridge.stop().catch(() => undefined)
@@ -218,11 +219,39 @@ function Shortcut({ keys, label }: { keys: string; label: string }) {
 async function openHud() {
   if (!isTauri()) return
   const existing = await WebviewWindow.getByLabel("recorder-hud")
-  if (existing) { await existing.setSize(new LogicalSize(554, 68)); await existing.show(); return }
-  const hud = new WebviewWindow("recorder-hud", { url: "/?surface=hud", title: "Crumbtrail recorder", width: 554, height: 68, x: 520, y: 24, decorations: false, transparent: true, alwaysOnTop: true, skipTaskbar: true, resizable: false, focus: true, shadow: false })
+  if (existing) {
+    await whenNativeWindowReady(() => existing.setSize(new LogicalSize(554, 68)))
+    await whenNativeWindowReady(() => existing.show())
+    return
+  }
+  const hud = new WebviewWindow("recorder-hud", { url: "/?surface=hud", title: "Crumbtrail recorder", width: 554, height: 68, x: 520, y: 24, decorations: false, transparent: true, alwaysOnTop: true, skipTaskbar: true, resizable: false, focus: true, shadow: false, visible: false })
   await new Promise<void>((resolve, reject) => {
     void hud.once("tauri://created", () => resolve())
     void hud.once("tauri://error", event => reject(event.payload))
+  })
+}
+
+async function openRecordingOverlay(target?: CaptureTargetDescriptor | null) {
+  if (!isTauri() || !target) return
+  const existing = await WebviewWindow.getByLabel("recording-overlay")
+  if (existing) await existing.close()
+  const overlay = new WebviewWindow("recording-overlay", {
+    url: "/?surface=recording-overlay",
+    title: "Crumbtrail recording indicator",
+    width: 1,
+    height: 1,
+    decorations: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: false,
+    focus: false,
+    shadow: false,
+    visible: false,
+  })
+  await new Promise<void>((resolve, reject) => {
+    void overlay.once("tauri://created", () => resolve())
+    void overlay.once("tauri://error", event => reject(event.payload))
   })
 }
 

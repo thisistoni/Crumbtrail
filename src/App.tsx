@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { getCurrentWindow } from "@tauri-apps/api/window"
 import { ThemeProvider } from "next-themes"
 import { toast } from "sonner"
@@ -10,6 +10,7 @@ import { SettingsProvider } from "@/lib/settings"
 import { Editor } from "@/screens/editor"
 import { Home } from "@/screens/home"
 import { RecordingHud } from "@/screens/recording-hud"
+import { RecordingOverlay } from "@/screens/recording-overlay"
 import { RecordingSetup } from "@/screens/recording-setup"
 import { RegionSelector } from "@/screens/region-selector"
 import type { ProjectManifest, RecordingStateSnapshot, Step } from "@/types"
@@ -20,6 +21,7 @@ export default function App() {
   const surface = new URLSearchParams(window.location.search).get("surface")
   document.documentElement.dataset.surface = surface ?? "app"
   if (surface === "hud") return <Providers><RecordingHud /></Providers>
+  if (surface === "recording-overlay") return <RecordingOverlay />
   if (surface === "region") return <Providers><RegionSelector /></Providers>
   return <Providers><MainApp /></Providers>
 }
@@ -37,6 +39,12 @@ function MainApp() {
   const { locale } = useLocale()
   const [navigation, setNavigation] = useState<{ view: View; back: View[] }>({ view: "home", back: [] })
   const [project, setProject] = useState<ProjectManifest | null>(null)
+  const projectRef = useRef<ProjectManifest | null>(null)
+
+  useEffect(() => { projectRef.current = project }, [project])
+  useEffect(() => {
+    setProject(current => current ? projectWithAppLocale(current, locale) : current)
+  }, [locale])
 
   function navigate(view: View) {
     setNavigation(current => current.view === view ? current : { view, back: [...current.back, current.view] })
@@ -51,7 +59,24 @@ function MainApp() {
   }
 
   function finishRecording() {
-    setNavigation(current => ({ view: "editor", back: current.back.at(-1) === "editor" ? current.back.slice(0, -1) : current.back }))
+    const view: View = projectRef.current?.steps.length ? "editor" : "setup"
+    setNavigation(current => ({ view, back: view === "editor" && current.back.at(-1) === "editor" ? current.back.slice(0, -1) : current.back }))
+  }
+
+  async function leaveProject() {
+    if (!project || project.steps.length > 0) {
+      back()
+      return
+    }
+    try {
+      await bridge.deleteSession(project.id)
+    } catch (error) {
+      toast.error(locale === "de" ? "Entwurf konnte nicht verworfen werden" : "Could not discard the draft", { description: String(error) })
+      return
+    }
+    projectRef.current = null
+    setProject(null)
+    setNavigation(current => ({ view: current.back.at(-1) ?? "home", back: current.back.slice(0, -1) }))
   }
 
   useEffect(() => {
@@ -77,10 +102,20 @@ function MainApp() {
     return () => unlisteners.forEach(stop => stop())
   }, [locale])
 
-  if (navigation.view === "home" || !project) return <Home onOpen={opened => { setProject(opened); navigate("editor") }} onNew={created => { setProject(created); navigate("setup") }} />
-  if (navigation.view === "setup") return <RecordingSetup project={project} onBack={back} onProject={setProject} onStarted={() => replace("recording")} />
+  if (navigation.view === "home" || !project) return <Home onOpen={opened => { setProject(projectWithAppLocale(opened, locale)); navigate("editor") }} onNew={created => { setProject(projectWithAppLocale(created, locale)); navigate("setup") }} />
+  if (navigation.view === "setup") return <RecordingSetup project={project} onBack={() => void leaveProject()} onProject={setProject} onStarted={() => replace("recording")} />
   if (navigation.view === "recording") return <main className="grid h-screen place-items-center bg-background"><span className="sr-only">Recording</span></main>
-  return <Editor project={project} onProject={setProject} onHome={back} onRecord={() => navigate("setup")} />
+  return <Editor project={project} onProject={setProject} onHome={() => void leaveProject()} onRecord={() => navigate("setup")} />
+}
+
+export function projectWithAppLocale(project: ProjectManifest, locale: "en" | "de"): ProjectManifest {
+  const preset = project.theme.preset === "cleanPrint" ? "crumbtrailLight" : project.theme.preset
+  if (project.theme.reportLocale === locale && project.capture.instructionLocale === locale && preset === project.theme.preset) return project
+  return {
+    ...project,
+    theme: { ...project.theme, preset, reportLocale: locale },
+    capture: { ...project.capture, instructionLocale: locale },
+  }
 }
 
 async function showMainWindow() {

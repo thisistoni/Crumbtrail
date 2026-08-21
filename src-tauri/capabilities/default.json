@@ -5,6 +5,7 @@
   "windows": [
     "main",
     "recorder-hud",
+    "recording-overlay",
     "region-selector"
   ],
   "permissions": [
@@ -14,6 +15,7 @@
     "core:window:allow-set-always-on-top",
     "core:window:allow-set-position",
     "core:window:allow-set-size",
+    "core:window:allow-set-ignore-cursor-events",
     "core:window:allow-show",
     "dialog:allow-open",
     "dialog:allow-save"

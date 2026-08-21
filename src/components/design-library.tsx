@@ -1,6 +1,7 @@
 import { useRef, useState } from "react"
 import { ImagePlus, MoreHorizontal, Palette, Pencil, Plus, Trash2, X } from "lucide-react"
 import { toast } from "sonner"
+import { CrumbMark } from "@/components/brand"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
@@ -12,7 +13,7 @@ import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { useLocale } from "@/lib/i18n"
-import type { AppLocale, DesignTemplate, ReportTheme, TypographyPreset } from "@/types"
+import type { DesignTemplate, ReportTheme, TypographyPreset } from "@/types"
 
 interface DesignLibraryProps {
   templates: DesignTemplate[]
@@ -23,10 +24,10 @@ interface DesignLibraryProps {
 export function DesignLibrary({ templates, onSave, onDelete }: DesignLibraryProps) {
   const { locale, t } = useLocale()
   const [open, setOpen] = useState(false)
-  const [draft, setDraft] = useState<DesignTemplate>(() => emptyDesign(locale))
+  const [draft, setDraft] = useState<DesignTemplate>(emptyDesign)
 
   function create() {
-    setDraft(emptyDesign(locale))
+    setDraft(emptyDesign())
     setOpen(true)
   }
 
@@ -61,13 +62,11 @@ export function DesignLibrary({ templates, onSave, onDelete }: DesignLibraryProp
 function DesignCard({ template, onEdit, onDelete }: { template: DesignTemplate; onEdit(template: DesignTemplate): void; onDelete(id: string): void }) {
   const { locale } = useLocale()
   return <Card className="overflow-hidden p-0">
-    <div className="h-24 p-4" style={{ backgroundColor: template.theme.preset === "crumbtrailDark" ? "#1d1e21" : "#e9e7e1" }}>
-      <div className="flex h-full items-center gap-3 rounded-lg bg-card px-4 shadow-sm">
-        {template.logoDataUrl ? <img src={template.logoDataUrl} alt="" className="size-10 rounded-md object-contain" /> : <span className="size-10 rounded-md" style={{ backgroundColor: template.theme.accent }} />}
-        <span className="h-2 flex-1 rounded-full" style={{ backgroundColor: template.theme.accent }} />
-      </div>
+    <div className="flex h-24 items-center gap-4 px-5" style={{ backgroundColor: template.theme.preset === "crumbtrailDark" ? "#1d1e21" : "#e9e7e1" }}>
+      {template.logoDataUrl ? <img src={template.logoDataUrl} alt="" className="size-10 rounded-md object-contain" /> : <CrumbMark className="size-10" />}
+      <span className="h-2 flex-1 rounded-full" style={{ backgroundColor: template.theme.accent }} />
     </div>
-    <CardHeader className="flex-row items-start gap-3 border-t">
+    <CardHeader className="flex flex-row items-start gap-3">
       <div className="min-w-0 flex-1"><CardTitle className="truncate">{template.name}</CardTitle>{template.author && <p className="mt-1 truncate text-xs text-muted-foreground">{template.author}</p>}</div>
       <DropdownMenu>
         <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label={locale === "de" ? "Designaktionen" : "Design actions"} />}><MoreHorizontal /></DropdownMenuTrigger>
@@ -105,13 +104,13 @@ function DesignDialog({ open, onOpenChange, draft, onDraft, onSave }: { open: bo
           <Field><FieldLabel>{locale === "de" ? "Akzentfarbe" : "Accent color"}</FieldLabel><div className="flex gap-2"><input aria-label={locale === "de" ? "Akzentfarbe" : "Accent color"} type="color" value={draft.theme.accent} onChange={event => patchTheme({ accent: event.target.value })} className="size-9 rounded-lg border bg-transparent p-1" /><Input value={draft.theme.accent} onChange={event => /^#[0-9a-f]{0,6}$/i.test(event.target.value) && patchTheme({ accent: event.target.value })} /></div></Field>
         </div>
         <Field><FieldLabel htmlFor="design-description">{locale === "de" ? "Beschreibung" : "Description"}</FieldLabel><Textarea id="design-description" value={draft.description} onChange={event => patch({ description: event.target.value })} rows={3} /></Field>
-        <Field><FieldLabel>{locale === "de" ? "Berichtsstil" : "Report style"}</FieldLabel><ToggleGroup value={[draft.theme.preset]} onValueChange={value => value[0] && patchTheme({ preset: value[0] as ReportTheme })} variant="outline" className="grid grid-cols-3"><ToggleGroupItem value="crumbtrailLight">Light</ToggleGroupItem><ToggleGroupItem value="crumbtrailDark">Dark</ToggleGroupItem><ToggleGroupItem value="cleanPrint">Print</ToggleGroupItem></ToggleGroup></Field>
+        <Field><FieldLabel>{locale === "de" ? "Berichtsstil" : "Report style"}</FieldLabel><ToggleGroup value={[draft.theme.preset]} onValueChange={value => value[0] && patchTheme({ preset: value[0] as ReportTheme })} variant="outline" className="grid grid-cols-2"><ToggleGroupItem value="crumbtrailLight">Light</ToggleGroupItem><ToggleGroupItem value="crumbtrailDark">Dark</ToggleGroupItem></ToggleGroup></Field>
         <Field><FieldLabel>{locale === "de" ? "Typografie" : "Typography"}</FieldLabel><ToggleGroup value={[draft.theme.typography]} onValueChange={value => value[0] && patchTheme({ typography: value[0] as TypographyPreset })} variant="outline" className="grid grid-cols-3"><ToggleGroupItem value="modern">Modern</ToggleGroupItem><ToggleGroupItem value="editorial">Editorial</ToggleGroupItem><ToggleGroupItem value="compact">Compact</ToggleGroupItem></ToggleGroup></Field>
         <Field><FieldLabel>Logo</FieldLabel><input ref={logoInput} className="hidden" type="file" accept="image/png,image/jpeg" onChange={event => readLogo(event.target.files?.[0])} /><div className="flex items-center gap-3">{draft.logoDataUrl && <img src={draft.logoDataUrl} alt="" className="size-12 rounded-lg border object-contain" />}<Button variant="outline" onClick={() => logoInput.current?.click()}><ImagePlus data-icon="inline-start" />{draft.logoDataUrl ? (locale === "de" ? "Logo ersetzen" : "Replace logo") : (locale === "de" ? "Logo hinzufügen" : "Add logo")}</Button>{draft.logoDataUrl && <Button variant="ghost" onClick={() => patch({ logoDataUrl: null })}><X data-icon="inline-start" />{locale === "de" ? "Entfernen" : "Remove"}</Button>}</div></Field>
-        <Field><FieldLabel>{locale === "de" ? "Berichtssprache" : "Report language"}</FieldLabel><ToggleGroup value={[draft.theme.reportLocale]} onValueChange={value => value[0] && patchTheme({ reportLocale: value[0] as AppLocale })} variant="outline" className="grid grid-cols-2"><ToggleGroupItem value="en">English</ToggleGroupItem><ToggleGroupItem value="de">Deutsch</ToggleGroupItem></ToggleGroup></Field>
         <div className="grid gap-3 sm:grid-cols-2">
           <Field orientation="horizontal"><Switch checked={draft.theme.showApplicationNames} onCheckedChange={value => patchTheme({ showApplicationNames: value })} /><FieldLabel>{locale === "de" ? "Anwendungsnamen" : "Application names"}</FieldLabel></Field>
           <Field orientation="horizontal"><Switch checked={draft.theme.showTimestamps} onCheckedChange={value => patchTheme({ showTimestamps: value })} /><FieldLabel>{locale === "de" ? "Zeitstempel" : "Timestamps"}</FieldLabel></Field>
+          <Field orientation="horizontal"><Switch id="design-crumbtrail-branding" checked={draft.theme.showCrumbtrailBranding} onCheckedChange={value => patchTheme({ showCrumbtrailBranding: value })} /><FieldLabel htmlFor="design-crumbtrail-branding">{locale === "de" ? "„Erstellt mit Crumbtrail“ anzeigen" : "Show “Created with Crumbtrail”"}</FieldLabel></Field>
         </div>
       </FieldGroup>
       <DialogFooter><Button variant="outline" onClick={() => onOpenChange(false)}>{locale === "de" ? "Abbrechen" : "Cancel"}</Button><Button onClick={onSave} disabled={!draft.name.trim()}>{locale === "de" ? "Design speichern" : "Save design"}</Button></DialogFooter>
@@ -119,10 +118,10 @@ function DesignDialog({ open, onOpenChange, draft, onDraft, onSave }: { open: bo
   </Dialog>
 }
 
-function emptyDesign(locale: AppLocale): DesignTemplate {
+function emptyDesign(): DesignTemplate {
   const now = new Date().toISOString()
-  return { id: crypto.randomUUID(), name: "", author: "", description: "", logoDataUrl: null, createdAt: now, updatedAt: now, theme: { preset: "crumbtrailLight", accent: "#E9A23B", typography: "modern", logoAsset: null, showTimestamps: false, showApplicationNames: true, reportLocale: locale } }
+  return { id: crypto.randomUUID(), name: "", author: "", description: "", logoDataUrl: null, createdAt: now, updatedAt: now, theme: { preset: "crumbtrailLight", accent: "#E9A23B", typography: "modern", logoAsset: null, showTimestamps: false, showApplicationNames: true, showCrumbtrailBranding: true } }
 }
 
-function reportThemeName(theme: ReportTheme) { return theme === "crumbtrailLight" ? "Crumbtrail Light" : theme === "crumbtrailDark" ? "Crumbtrail Dark" : "Clean Print" }
+function reportThemeName(theme: ReportTheme) { return theme === "crumbtrailDark" ? "Crumbtrail Dark" : "Crumbtrail Light" }
 function typographyName(typography: TypographyPreset) { return typography[0].toUpperCase() + typography.slice(1) }

@@ -1,4 +1,4 @@
-import type { DesignTemplate, ProjectManifest } from "@/types"
+import type { DesignTemplate, ProjectManifest, ThemeSettings } from "@/types"
 
 const STORAGE_KEY = "crumbtrail.design-templates.v1"
 const LEGACY_KEY = "crumbtrail.theme-presets.v1"
@@ -13,7 +13,7 @@ export function loadDesignTemplates(): DesignTemplate[] {
     name: item.name,
     author: "",
     description: "",
-    theme: { ...item.theme, logoAsset: null },
+    theme: designTheme(item.theme),
     logoDataUrl: null,
     createdAt: now,
     updatedAt: now,
@@ -29,7 +29,7 @@ export function designFromProject(name: string, project: ProjectManifest, logoDa
     name: name.trim() || "Design",
     author: project.author,
     description: project.description,
-    theme: { ...structuredClone(project.theme), logoAsset: null },
+    theme: designTheme(project.theme),
     logoDataUrl: logoDataUrl ?? null,
     createdAt: now,
     updatedAt: now,
@@ -44,7 +44,7 @@ export function upsertDesignTemplate(template: DesignTemplate): DesignTemplate[]
     name: template.name.trim() || "Design",
     createdAt: previous?.createdAt ?? template.createdAt,
     updatedAt: new Date().toISOString(),
-    theme: { ...structuredClone(template.theme), logoAsset: null },
+    theme: designTheme(template.theme),
   }
   const next = previous ? existing.map(item => item.id === template.id ? nextTemplate : item) : [...existing, nextTemplate]
   persist(next)
@@ -60,7 +60,9 @@ export function deleteDesignTemplate(id: string): DesignTemplate[] {
 function parse(value: string | null): DesignTemplate[] {
   try {
     const parsed = JSON.parse(value ?? "[]") as DesignTemplate[]
-    return parsed.filter(item => item && typeof item.id === "string" && typeof item.name === "string" && typeof item.author === "string" && item.theme)
+    return parsed
+      .filter(item => item && typeof item.id === "string" && typeof item.name === "string" && typeof item.author === "string" && item.theme)
+      .map(item => ({ ...item, theme: designTheme(item.theme) }))
   } catch { return [] }
 }
 
@@ -73,4 +75,16 @@ function parseLegacy(value: string | null): { id: string; name: string; theme: D
 
 function persist(templates: DesignTemplate[]) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(templates))
+}
+
+function designTheme(theme: DesignTemplate["theme"] | ThemeSettings): DesignTemplate["theme"] {
+  return {
+    preset: theme.preset === "cleanPrint" ? "crumbtrailLight" : theme.preset,
+    accent: theme.accent,
+    typography: theme.typography,
+    logoAsset: null,
+    showTimestamps: theme.showTimestamps,
+    showApplicationNames: theme.showApplicationNames,
+    showCrumbtrailBranding: theme.showCrumbtrailBranding !== false,
+  }
 }

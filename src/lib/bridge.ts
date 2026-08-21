@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core"
 import { listen, type UnlistenFn } from "@tauri-apps/api/event"
 import type {
-  CaptureTargetDescriptor, CaptureTargetKind, ExportRequest, ExportResult, PixelRect, ProjectManifest,
+  ApplicationSummary, CaptureTargetDescriptor, CaptureTargetKind, ExportRequest, ExportResult, PixelRect, ProjectManifest,
   ProjectSummary, RecordingOptions, RecordingStateSnapshot, Step,
 } from "@/types"
 import { defaultRecordingOptions } from "@/types"
@@ -23,10 +23,16 @@ const mockImage = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`
   <rect x="912" y="545" width="210" height="54" rx="12" fill="#292722"/><text x="981" y="579" font-family="Segoe UI" font-size="18" fill="#fff">Save</text>
 </svg>`)}`
 
+const mockApplicationIcon = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">
+  <rect width="96" height="96" rx="22" fill="#292722"/>
+  <path d="M25 67 45 25h9l18 42H60l-4-10H40l-4 10H25Zm19-20h9l-4-11-5 11Z" fill="#E9A23B"/>
+</svg>`)}`
+
 const makeSampleSteps = (): Step[] => [
   {
     id: crypto.randomUUID(), kind: "click", instruction: "Select Dark mode", notes: "Choose the darker appearance for this workspace.",
-    createdAt: new Date().toISOString(), included: true, application: "Acme Settings", media: { beforeAsset: "mock://settings", afterAsset: "mock://settings", selected: "before" },
+    createdAt: new Date().toISOString(), included: true, application: "Acme Settings", applicationIconAsset: "mock://application/acme", media: { beforeAsset: "mock://settings", afterAsset: "mock://settings", selected: "before" },
     control: { name: "Dark mode", controlType: "RadioButton", automationId: "theme-dark", isPassword: false, bounds: { x: .12, y: .47, width: .31, height: .09 } },
     annotations: [
       { id: crypto.randomUUID(), kind: "elementOutline", rect: { x: .12, y: .47, width: .31, height: .09 }, color: "#ef4444", strokeWidth: 3, rotation: 0, opacity: 1, zIndex: 0, markerSize: 18, protected: false },
@@ -34,7 +40,7 @@ const makeSampleSteps = (): Step[] => [
   },
   {
     id: crypto.randomUUID(), kind: "click", instruction: "Click Save", notes: "", createdAt: new Date().toISOString(), included: true,
-    application: "Acme Settings", media: { beforeAsset: "mock://settings", afterAsset: "mock://settings", selected: "before" },
+    application: "Acme Settings", applicationIconAsset: "mock://application/acme", media: { beforeAsset: "mock://settings", afterAsset: "mock://settings", selected: "before" },
     control: { name: "Save", controlType: "Button", automationId: "save", isPassword: false, bounds: { x: .71, y: .76, width: .17, height: .08 } },
     annotations: [{ id: crypto.randomUUID(), kind: "elementOutline", rect: { x: .71, y: .76, width: .17, height: .08 }, color: "#ef4444", strokeWidth: 3, rotation: 0, opacity: 1, zIndex: 0, markerSize: 22, protected: false }],
   },
@@ -45,7 +51,7 @@ export function createMockProject(title = "Workspace appearance guide"): Project
   return {
     schemaVersion: 2, id: crypto.randomUUID(), title, description: "A short, polished walkthrough recorded with Crumbtrail.", author: "",
     createdAt: now, updatedAt: now, capture: { ...defaultRecordingOptions }, steps: makeSampleSteps(),
-    theme: { preset: "crumbtrailLight", accent: "#E9A23B", typography: "modern", logoAsset: null, showTimestamps: false, showApplicationNames: true, reportLocale: "en" },
+    theme: { preset: "crumbtrailLight", accent: "#E9A23B", typography: "modern", logoAsset: null, showTimestamps: false, showApplicationNames: true, showCrumbtrailBranding: true, reportLocale: "en" },
   }
 }
 
@@ -54,10 +60,25 @@ let browserRecording: RecordingStateSnapshot = { status: "idle", stepCount: 0, e
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> { return invoke<T>(command, args) }
 
+function summarizeApplications(steps: Step[]): ApplicationSummary[] {
+  const applications = new Map<string, ApplicationSummary>()
+  for (const step of steps) {
+    if (!step.application) continue
+    const key = step.application.toLocaleLowerCase()
+    const existing = applications.get(key)
+    if (existing) {
+      if (!existing.iconAsset && step.applicationIconAsset) existing.iconAsset = step.applicationIconAsset
+    } else {
+      applications.set(key, { name: step.application, iconAsset: step.applicationIconAsset })
+    }
+  }
+  return Array.from(applications.values())
+}
+
 export const bridge = {
   async createProject(title: string) {
     if (isTauri()) return call<ProjectManifest>("create_project", { title })
-    const project = createMockProject(title || "Untitled guide"); project.steps = []; browserSessions.unshift(project); return project
+    const project = createMockProject(title || "Untitled guide"); project.steps = []; return project
   },
   async autosave(project: ProjectManifest) {
     if (isTauri()) return call<ProjectManifest>("autosave_project", { project })
@@ -65,7 +86,14 @@ export const bridge = {
   },
   async listSessions(): Promise<ProjectSummary[]> {
     if (isTauri()) return call("list_sessions")
-    return browserSessions.map(item => ({ id: item.id, title: item.title, updatedAt: item.updatedAt, stepCount: item.steps.length, recoverable: true }))
+    return browserSessions.filter(item => item.steps.length > 0).map(item => ({
+      id: item.id,
+      title: item.title,
+      updatedAt: item.updatedAt,
+      stepCount: item.steps.length,
+      recoverable: true,
+      applications: summarizeApplications(item.steps),
+    }))
   },
   async loadSession(id: string) {
     if (isTauri()) return call<ProjectManifest>("load_session", { id })
@@ -79,6 +107,7 @@ export const bridge = {
   saveProject: (project: ProjectManifest, destination: string) => call<string>("save_project", { project, destination }),
   replaceImage: (projectId: string, source: string) => call<string>("replace_image", { projectId, source }),
   async assetUrl(projectId: string, asset?: string | null) {
+    if (asset?.startsWith("mock://application/")) return mockApplicationIcon
     if (!asset || asset.startsWith("mock://") || !isTauri()) return mockImage
     return call<string>("read_asset_data_url", { projectId, asset })
   },

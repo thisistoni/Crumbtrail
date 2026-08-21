@@ -1,13 +1,8 @@
 import { cn } from "@/lib/utils"
+import crumbtrailLogo from "@/assets/brand/crumbtrail-logo.png"
 
 export function CrumbMark({ className }: { className?: string }) {
-  return (
-    <span className={cn("relative block size-8 shrink-0", className)} aria-hidden="true">
-      <span className="absolute left-0 top-3.5 size-2 rounded-full bg-breadcrumb" />
-      <span className="absolute left-2.5 top-1.5 size-2.5 rounded-full bg-breadcrumb" />
-      <span className="absolute bottom-0 right-0 size-3.5 rounded-full bg-foreground" />
-    </span>
-  )
+  return <img data-crumbtrail-mark src={crumbtrailLogo} alt="" className={cn("size-9 shrink-0 object-contain", className)} aria-hidden="true" />
 }
 
 export function Brand({ compact = false }: { compact?: boolean }) {

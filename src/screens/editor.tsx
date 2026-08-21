@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react"
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog"
 import {
   ArrowLeft, ArrowRight, Blend, BoxSelect, ChevronDown, CircleDot, Copy, Crop, Download, Eye, FileArchive,
-  FileCode2, FileImage, FileText, ImagePlus, Languages, LocateFixed, Merge, Minus, MonitorDot,
+  FileCode2, FileImage, FileText, ImagePlus, LocateFixed, Merge, Minus, MonitorDot,
   MoreHorizontal, Paintbrush, PanelRight, Plus, RectangleHorizontal, Redo2, RotateCcw, Trash2,
   Type, Undo2, ZoomIn,
 } from "lucide-react"
@@ -48,10 +48,13 @@ const annotationTools: { kind: AnnotationKind; icon: typeof CircleDot }[] = [
   { kind: "text", icon: Type }, { kind: "blur", icon: Blend }, { kind: "crop", icon: Crop },
 ]
 
+const assetUrlCache = new Map<string, string>()
+const FULL_VIEW: NormalizedRect = { x: 0, y: 0, width: 1, height: 1 }
+
 export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
   const [selectedId, setSelectedId] = useState(project.steps[0]?.id ?? null)
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null)
-  const [imageUrl, setImageUrl] = useState("")
+  const [loadedImage, setLoadedImage] = useState({ key: "", url: "" })
   const [previewOpen, setPreviewOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
   const [saved, setSaved] = useState(true)
@@ -69,13 +72,25 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
   const { settings } = useSettings()
   const selectedIndex = Math.max(0, project.steps.findIndex(item => item.id === selectedId))
   const step = project.steps[selectedIndex]
-  const selectedAnnotation = step?.annotations.find(item => item.id === selectedAnnotationId) ?? null
+  const cropAnnotation = step?.annotations.find(item => item.kind === "crop") ?? null
+  const selectedAnnotation = step?.annotations.find(item => item.id === selectedAnnotationId && item.kind !== "crop") ?? null
   const selectedAsset = step ? (step.media.selected === "before" ? step.media.beforeAsset ?? step.media.afterAsset : step.media.afterAsset ?? step.media.beforeAsset) : null
+  const selectedAssetKey = selectedAsset ? `${project.id}:${selectedAsset}` : ""
+  const imageUrl = assetUrlCache.get(selectedAssetKey) ?? (loadedImage.key === selectedAssetKey ? loadedImage.url : "")
 
   useEffect(() => {
-    if (!selectedId) { setImageUrl(""); return }
-    bridge.assetUrl(project.id, selectedAsset).then(setImageUrl).catch(() => setImageUrl(""))
-  }, [project.id, selectedId, selectedAsset])
+    if (!selectedAsset || !selectedAssetKey) { setLoadedImage({ key: "", url: "" }); return }
+    const cached = assetUrlCache.get(selectedAssetKey)
+    if (cached) { setLoadedImage({ key: selectedAssetKey, url: cached }); return }
+    let active = true
+    setLoadedImage({ key: selectedAssetKey, url: "" })
+    bridge.assetUrl(project.id, selectedAsset).then(url => {
+      if (!active) return
+      assetUrlCache.set(selectedAssetKey, url)
+      setLoadedImage({ key: selectedAssetKey, url })
+    }).catch(() => { if (active) setLoadedImage({ key: selectedAssetKey, url: "" }) })
+    return () => { active = false }
+  }, [project.id, selectedAsset, selectedAssetKey])
 
   useEffect(() => {
     if (saved) return
@@ -149,10 +164,31 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
   function addAnnotation(kind: AnnotationKind) {
     if (!step) return
     const existingCrop = step.annotations.find(item => item.kind === "crop")
-    if (kind === "crop" && existingCrop) { setSelectedAnnotationId(existingCrop.id); setCropMode(true); return }
-    const rect: NormalizedRect = kind === "clickMarker" ? { x: .49, y: .49, width: .02, height: .02 } : kind === "crop" ? { x: .05, y: .05, width: .9, height: .9 } : { x: .34, y: .34, width: .32, height: .2 }
-    const annotation: Annotation = { id: crypto.randomUUID(), kind, rect, color: "#ef4444", label: kind === "text" ? "Text" : null, strokeWidth: settings.defaultStrokeWidth, rotation: 0, opacity: 1, zIndex: Math.max(-1, ...step.annotations.map(item => item.zIndex)) + 1, markerSize: 18, protected: false }
-    updateStep({ annotations: [...step.annotations, annotation] })
+    if (cropMode && kind !== "crop") {
+      setCropMode(false)
+      setSelectedAnnotationId(null)
+    }
+    if (kind === "crop" && existingCrop) {
+      if (step.focusZoom) updateStep({ focusZoom: null })
+      setSelectedAnnotationId(existingCrop.id)
+      setCropMode(true)
+      return
+    }
+    const view = kind === "crop" ? FULL_VIEW : cropAnnotation?.rect ?? step.focusZoom ?? FULL_VIEW
+    const annotation: Annotation = {
+      id: crypto.randomUUID(),
+      kind,
+      rect: annotationRectForView(kind, view),
+      color: "#ef4444",
+      label: kind === "text" ? "Text" : null,
+      strokeWidth: settings.defaultStrokeWidth,
+      rotation: 0,
+      opacity: 1,
+      zIndex: Math.max(-1, ...step.annotations.map(item => item.zIndex)) + 1,
+      markerSize: 18,
+      protected: false,
+    }
+    updateStep({ annotations: [...step.annotations, annotation], ...(kind === "crop" ? { focusZoom: null } : {}) })
     setSelectedAnnotationId(annotation.id)
     if (kind === "crop") setCropMode(true)
   }
@@ -177,13 +213,17 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
     const crop = step?.annotations.find(item => item.kind === "crop")
     if (crop) deleteAnnotation(crop.id)
   }
-  function toggleFocusZoom() { if (step) updateStep({ focusZoom: step.focusZoom ? null : focusRect(step, project.capture.defaultFocusZoomPercent) }) }
+  function toggleFocusZoom() {
+    if (!step || cropAnnotation) return
+    updateStep({ focusZoom: step.focusZoom ? null : focusRect(step, project.capture.defaultFocusZoomPercent) })
+  }
 
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null
-      const editing = target?.matches("input, textarea, select, [contenteditable='true']")
-      if ((event.key === "Delete" || event.code === "Delete") && selectedAnnotation && step && !selectedAnnotation.protected && !editing) {
+      const target = event.target
+      const editing = target instanceof Element && target.matches("input, textarea, select, [contenteditable='true']")
+      const deletePressed = ["Delete", "Backspace"].includes(event.key) || event.code === "Delete"
+      if (deletePressed && selectedAnnotation && step && !selectedAnnotation.protected && !editing) {
         event.preventDefault()
         const next = { ...project, steps: project.steps.map(item => item.id === step.id ? { ...item, annotations: item.annotations.filter(annotation => annotation.id !== selectedAnnotation.id) } : item) }
         undoStack.current.push(project)
@@ -208,8 +248,8 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
       if (event.key === "-") { event.preventDefault(); changeZoom(value => Math.max(.25, value - .1)) }
       if (event.key === "0") { event.preventDefault(); changeZoom(() => 1) }
     }
-    window.addEventListener("keydown", keydown)
-    return () => window.removeEventListener("keydown", keydown)
+    window.addEventListener("keydown", keydown, true)
+    return () => window.removeEventListener("keydown", keydown, true)
   }, [canvasHot, onProject, project, selectedAnnotation, step])
 
   function beginCanvasPan(event: React.PointerEvent<HTMLDivElement>) {
@@ -290,7 +330,7 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
           <div className="flex h-14 items-center justify-between px-4"><p className="text-sm font-semibold">{t("steps")} <span className="ml-1 font-normal tabular-nums text-muted-foreground">{project.steps.filter(item => item.included).length}/{project.steps.length}</span></p><Button variant="ghost" size="icon-sm" onClick={onRecord} aria-label={t("record")}><Plus /></Button></div>
           <Separator />
           <ScrollArea className="min-h-0 flex-1">
-            {project.steps.length ? <StepTimeline steps={project.steps} selectedId={step?.id ?? null} onSelect={setSelectedId} onReorder={steps => commit({ ...project, steps })} onDuplicate={duplicateStep} onMergeNext={mergeNext} onDelete={deleteStep} /> : <Empty className="border-0 py-16"><EmptyHeader><EmptyMedia variant="icon"><MonitorDot /></EmptyMedia><EmptyTitle>{locale === "de" ? "Noch keine Schritte" : "No steps yet"}</EmptyTitle></EmptyHeader></Empty>}
+            {project.steps.length ? <StepTimeline projectId={project.id} steps={project.steps} selectedId={step?.id ?? null} onSelect={setSelectedId} onReorder={steps => commit({ ...project, steps })} onDuplicate={duplicateStep} onMergeNext={mergeNext} onDelete={deleteStep} /> : <Empty className="border-0 py-16"><EmptyHeader><EmptyMedia variant="icon"><MonitorDot /></EmptyMedia><EmptyTitle>{locale === "de" ? "Noch keine Schritte" : "No steps yet"}</EmptyTitle></EmptyHeader></Empty>}
           </ScrollArea>
           <div className="border-t p-3"><Button variant="outline" className="w-full" onClick={onRecord}><span className="size-2 rounded-full bg-red-500" />{t("record")}</Button></div>
         </aside>
@@ -299,15 +339,14 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
           <div className="flex h-14 shrink-0 items-center justify-between border-b bg-card/85 px-3 backdrop-blur">
             <div className="flex items-center gap-1">
               {annotationTools.map(tool => <ToolButton key={tool.kind} label={tool.kind === "crop" ? t("crop") : annotationLabel(tool.kind, locale)} onClick={() => addAnnotation(tool.kind)} disabled={!step} active={tool.kind === "crop" && cropMode}><tool.icon /></ToolButton>)}
-              {cropMode && <><Separator orientation="vertical" className="mx-1 h-6" /><Button size="sm" onClick={() => setCropMode(false)}>{t("confirmCrop")}</Button><Button size="sm" variant="ghost" onClick={resetCrop}><RotateCcw data-icon="inline-start" />{t("resetCrop")}</Button></>}
+              {cropMode && <><Separator orientation="vertical" className="mx-1 h-6" /><Button size="sm" onClick={() => { setCropMode(false); setSelectedAnnotationId(null) }}>{t("confirmCrop")}</Button><Button size="sm" variant="ghost" onClick={resetCrop}><RotateCcw data-icon="inline-start" />{t("resetCrop")}</Button></>}
             </div>
             <div className="flex items-center gap-1">
-              <Button variant={step?.focusZoom ? "secondary" : "ghost"} size="sm" onClick={toggleFocusZoom} disabled={!step}><LocateFixed data-icon="inline-start" />{t("autoZoom")}</Button>
+              <Button variant={step?.focusZoom && !cropAnnotation ? "secondary" : "ghost"} size="sm" onClick={toggleFocusZoom} disabled={!step || Boolean(cropAnnotation)}><LocateFixed data-icon="inline-start" />{t("autoZoom")}</Button>
               <Separator orientation="vertical" className="mx-1 h-6" />
               <ToolButton label={locale === "de" ? "Verkleinern" : "Zoom out"} onClick={() => changeZoom(value => Math.max(.25, value - .1))}><Minus /></ToolButton>
               <button className="w-14 text-center text-xs tabular-nums text-muted-foreground" onClick={() => changeZoom(() => 1)}>{Math.round(zoom * 100)}%</button>
               <ToolButton label={locale === "de" ? "Vergrößern" : "Zoom in"} onClick={() => changeZoom(value => Math.min(4, value + .1))}><ZoomIn /></ToolButton>
-              <Button variant="ghost" size="sm" onClick={fitCanvas}>{t("fit")}</Button>
             </div>
           </div>
           <div ref={canvasViewport} data-canvas-viewport tabIndex={0} className="relative min-h-0 flex-1 cursor-grab overflow-hidden p-8 outline-none" onPointerEnter={() => setCanvasHot(true)} onPointerLeave={() => setCanvasHot(false)} onPointerDown={beginCanvasPan} onWheel={event => { if (event.ctrlKey) { event.preventDefault(); changeZoom(value => Math.max(.25, Math.min(4, value - event.deltaY * .001))) } }}>
@@ -340,6 +379,7 @@ function ToolButton({ label, onClick, disabled, active, children }: { label: str
 
 function Inspector({ step, stepNumber, selectedAnnotation, onSelectAnnotation, updateStep, updateAnnotation, deleteAnnotation, duplicateStep, mergeNext, deleteStep, canMerge }: { step: Step; stepNumber: number; selectedAnnotation: Annotation | null; onSelectAnnotation(id: string): void; updateStep(patch: Partial<Step>): void; updateAnnotation(id: string, patch: Partial<Annotation>): void; deleteAnnotation(id: string): void; duplicateStep(): void; mergeNext(): void; deleteStep(): void; canMerge: boolean }) {
   const { locale, t } = useLocale()
+  const markings = step.annotations.filter(annotation => annotation.kind !== "crop")
   return <div className="p-5">
     <div className="flex items-start justify-between gap-2"><div><Badge variant="secondary">{locale === "de" ? "Schritt" : "Step"} {stepNumber}</Badge><h2 className="mt-3 text-lg font-semibold">{t("instruction")}</h2></div><DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon" aria-label={locale === "de" ? "Schrittaktionen" : "Step actions"} />}><MoreHorizontal /></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-60"><DropdownMenuGroup><DropdownMenuItem className="whitespace-nowrap" onClick={duplicateStep}><Copy />{t("duplicate")}</DropdownMenuItem><DropdownMenuItem className="whitespace-nowrap" onClick={mergeNext} disabled={!canMerge}><Merge />{locale === "de" ? "Mit nächstem verbinden" : "Merge with next"}</DropdownMenuItem></DropdownMenuGroup><DropdownMenuSeparator /><DropdownMenuGroup><DropdownMenuItem className="whitespace-nowrap" variant="destructive" onClick={deleteStep}><Trash2 />{locale === "de" ? "Schritt löschen" : "Delete step"}</DropdownMenuItem></DropdownMenuGroup></DropdownMenuContent></DropdownMenu></div>
     <FieldGroup className="mt-5">
@@ -351,27 +391,33 @@ function Inspector({ step, stepNumber, selectedAnnotation, onSelectAnnotation, u
     <p className="text-sm font-semibold">{locale === "de" ? "Screenshot-Zeitpunkt" : "Screenshot moment"}</p>
     <Tabs value={step.media.selected} onValueChange={value => updateStep({ media: { ...step.media, selected: value as "before" | "after" } })} className="mt-3"><TabsList className="w-full"><TabsTrigger value="before" className="flex-1" disabled={!step.media.beforeAsset}>{locale === "de" ? "Vorher" : "Before"}</TabsTrigger><TabsTrigger value="after" className="flex-1" disabled={!step.media.afterAsset}>{locale === "de" ? "Nachher" : "After"}</TabsTrigger></TabsList></Tabs>
     <Separator className="my-6" />
-    <div className="flex items-center justify-between"><p className="text-sm font-semibold">{t("annotations")}</p><span className="text-xs tabular-nums text-muted-foreground">{step.annotations.length}</span></div>
-    <div className="mt-3 grid gap-2">{step.annotations.map(annotation => <AnnotationRow key={annotation.id} annotation={annotation} selected={annotation.id === selectedAnnotation?.id} onSelect={() => onSelectAnnotation(annotation.id)} update={patch => updateAnnotation(annotation.id, patch)} remove={() => deleteAnnotation(annotation.id)} />)}</div>
+    <div className="flex items-center justify-between"><p className="text-sm font-semibold">{t("annotations")}</p><span className="text-xs tabular-nums text-muted-foreground">{markings.length}</span></div>
+    <div data-annotation-list className="mt-3 grid gap-2">{markings.map(annotation => <AnnotationRow key={annotation.id} annotation={annotation} selected={annotation.id === selectedAnnotation?.id} onSelect={() => onSelectAnnotation(annotation.id)} remove={() => deleteAnnotation(annotation.id)} />)}</div>
     {selectedAnnotation && <AnnotationProperties annotation={selectedAnnotation} update={patch => updateAnnotation(selectedAnnotation.id, patch)} remove={() => deleteAnnotation(selectedAnnotation.id)} />}
     {step.application && <div className="mt-6 rounded-xl bg-muted/65 p-3 text-xs"><p className="font-medium">{step.application}</p>{step.control && <p className="mt-1 text-muted-foreground">{step.control.controlType}{step.control.name ? ` · ${step.control.name}` : ""}</p>}</div>}
   </div>
 }
 
-function AnnotationRow({ annotation, selected, onSelect, update, remove }: { annotation: Annotation; selected: boolean; onSelect(): void; update(patch: Partial<Annotation>): void; remove(): void }) {
-  return <div role="button" tabIndex={0} onClick={onSelect} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect() } }} className={cn("flex items-center gap-2 rounded-lg border p-2 text-left", selected && "border-breadcrumb bg-breadcrumb-soft/45")}><span className="size-3 rounded-full" style={{ backgroundColor: annotation.color }} /><span className="min-w-0 flex-1 truncate text-xs capitalize">{annotation.kind.replace(/([A-Z])/g, " $1")}</span>{annotation.kind === "text" && <Input className="h-7 w-24 text-xs" value={annotation.label ?? ""} onClick={event => event.stopPropagation()} onChange={event => update({ label: event.target.value })} />}{annotation.protected ? <Badge variant="secondary" className="px-1.5 text-[9px]">Locked</Badge> : <Button variant="ghost" size="icon-xs" onClick={event => { event.stopPropagation(); remove() }} aria-label="Remove annotation"><Trash2 /></Button>}</div>
+function AnnotationRow({ annotation, selected, onSelect, remove }: { annotation: Annotation; selected: boolean; onSelect(): void; remove(): void }) {
+  const { locale } = useLocale()
+  return <div data-annotation-row={annotation.kind} role="button" tabIndex={0} onClick={onSelect} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect() } }} className={cn("flex items-center gap-2 rounded-lg border p-2 text-left", selected && "border-breadcrumb bg-breadcrumb-soft/45")}><span className="size-3 rounded-full" style={{ backgroundColor: annotation.color }} /><span className="min-w-0 flex-1 truncate text-xs">{annotationLabel(annotation.kind, locale)}</span>{annotation.protected ? <Badge variant="secondary" className="px-1.5 text-[9px]">Locked</Badge> : <Button variant="ghost" size="icon-xs" onClick={event => { event.stopPropagation(); remove() }} aria-label={locale === "de" ? "Markierung entfernen" : "Remove annotation"}><Trash2 /></Button>}</div>
 }
 
 function AnnotationProperties({ annotation, update, remove }: { annotation: Annotation; update(patch: Partial<Annotation>): void; remove(): void }) {
-  const { t } = useLocale()
-  return <div className="mt-4 grid gap-4 rounded-xl border bg-muted/25 p-3">
-    <div className="flex items-center gap-2"><FieldLabel className="flex-1">{t("color")}</FieldLabel><input aria-label={t("color")} type="color" value={annotation.color} onChange={event => update({ color: event.target.value })} className="size-7 cursor-pointer rounded border bg-transparent p-0" /></div>
-    <SliderField label={t("stroke")} value={annotation.strokeWidth} min={1} max={12} step={1} suffix="px" onChange={value => update({ strokeWidth: value })} />
-    <SliderField label={t("rotation")} value={annotation.rotation} min={-180} max={180} step={1} suffix="°" onChange={value => update({ rotation: value })} />
+  const { locale, t } = useLocale()
+  const hasColor = annotation.kind !== "blur"
+  const hasStroke = ["clickMarker", "elementOutline", "arrow", "rectangle"].includes(annotation.kind)
+  const hasRotation = ["elementOutline", "arrow", "rectangle", "text"].includes(annotation.kind)
+  return <FieldGroup data-annotation-properties={annotation.kind} className="mt-4 gap-4 rounded-xl border bg-muted/25 p-3">
+    {annotation.kind === "text" && <Field><FieldLabel htmlFor={`annotation-text-${annotation.id}`}>{locale === "de" ? "Text" : "Text"}</FieldLabel><Input id={`annotation-text-${annotation.id}`} value={annotation.label ?? ""} onChange={event => update({ label: event.target.value })} /></Field>}
+    {hasColor && <Field orientation="horizontal"><FieldLabel className="flex-1">{t("color")}</FieldLabel><input aria-label={t("color")} type="color" value={annotation.color} onChange={event => update({ color: event.target.value })} className="size-7 cursor-pointer rounded border bg-transparent p-0" /></Field>}
+    {hasStroke && <SliderField label={t("stroke")} value={annotation.strokeWidth} min={1} max={12} step={1} suffix="px" onChange={value => update({ strokeWidth: value })} />}
+    {hasRotation && <SliderField label={t("rotation")} value={annotation.rotation} min={-180} max={180} step={1} suffix="°" onChange={value => update({ rotation: value })} />}
     <SliderField label={t("opacity")} value={Math.round(annotation.opacity * 100)} min={10} max={100} step={1} suffix="%" onChange={value => update({ opacity: value / 100 })} />
     {annotation.kind === "clickMarker" && <SliderField label={t("size")} value={annotation.markerSize} min={8} max={64} step={1} suffix="px" onChange={value => update({ markerSize: value })} />}
+    {annotation.kind === "text" && <SliderField label={t("size")} value={annotation.markerSize} min={10} max={72} step={1} suffix="px" onChange={value => update({ markerSize: value })} />}
     {!annotation.protected && <Button variant="outline" size="sm" onClick={remove}><Trash2 data-icon="inline-start" />{t("deleteShape")}</Button>}
-  </div>
+  </FieldGroup>
 }
 
 function SliderField({ label, value, min, max, step, suffix, onChange }: { label: string; value: number; min: number; max: number; step: number; suffix: string; onChange(value: number): void }) {
@@ -386,14 +432,12 @@ function BrandingPanel({ project, update }: { project: ProjectManifest; update(p
   const themeItems = [
     { value: "crumbtrailLight", label: "Crumbtrail Light" },
     { value: "crumbtrailDark", label: "Crumbtrail Dark" },
-    { value: "cleanPrint", label: "Clean Print" },
   ]
   const typographyItems = [
     { value: "modern", label: "Modern" },
     { value: "editorial", label: "Editorial" },
     { value: "compact", label: locale === "de" ? "Kompakt" : "Compact" },
   ]
-  const languageItems = [{ value: "en", label: "English" }, { value: "de", label: "Deutsch" }]
   const patchTheme = (patch: Partial<ProjectManifest["theme"]>) => update({ theme: { ...project.theme, ...patch } })
   async function chooseLogo() {
     if (!isTauri()) return toast.info("Desktop only")
@@ -411,7 +455,7 @@ function BrandingPanel({ project, update }: { project: ProjectManifest; update(p
   async function applyDesign(design: DesignTemplate) {
     try {
       const logoAsset = design.logoDataUrl ? await bridge.importAssetDataUrl(project.id, design.logoDataUrl) : null
-      update({ author: design.author, description: design.description, theme: { ...design.theme, logoAsset } })
+      update({ author: design.author, description: design.description, theme: { ...project.theme, ...design.theme, reportLocale: locale, logoAsset } })
     } catch (error) { toast.error(String(error)) }
   }
   return <>
@@ -420,11 +464,11 @@ function BrandingPanel({ project, update }: { project: ProjectManifest; update(p
       <Field><FieldLabel htmlFor="author">{locale === "de" ? "Autor" : "Author"}</FieldLabel><Input id="author" value={project.author} onChange={event => update({ author: event.target.value })} /></Field>
       <Field><FieldLabel>{t("theme")}</FieldLabel><Select items={themeItems} value={project.theme.preset} onValueChange={value => patchTheme({ preset: value as ReportTheme })}><SelectTrigger className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectLabel>{t("theme")}</SelectLabel>{themeItems.map(item => <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
       <Field><FieldLabel>Typography</FieldLabel><Select items={typographyItems} value={project.theme.typography} onValueChange={value => patchTheme({ typography: value as TypographyPreset })}><SelectTrigger className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectLabel>Typography</SelectLabel>{typographyItems.map(item => <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
-      <Field><FieldLabel>{t("language")}</FieldLabel><Select items={languageItems} value={project.theme.reportLocale ?? locale} onValueChange={value => patchTheme({ reportLocale: value as "en" | "de" })}><SelectTrigger className="w-full"><Languages /><SelectValue /></SelectTrigger><SelectContent><SelectGroup>{languageItems.map(item => <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
       <Field><FieldLabel>{t("color")}</FieldLabel><div className="flex gap-2"><input type="color" value={project.theme.accent} onChange={event => patchTheme({ accent: event.target.value })} className="size-9 rounded-lg border bg-transparent p-1" /><Input value={project.theme.accent} onChange={event => /^#[0-9a-f]{0,6}$/i.test(event.target.value) && patchTheme({ accent: event.target.value })} /></div></Field>
       <Field><FieldLabel>Logo</FieldLabel><div className="flex gap-2"><Button variant="outline" className="flex-1" onClick={chooseLogo}><ImagePlus data-icon="inline-start" />{project.theme.logoAsset ? (locale === "de" ? "Logo ersetzen" : "Replace logo") : (locale === "de" ? "Logo hinzufügen" : "Add logo")}</Button>{project.theme.logoAsset && <Button variant="ghost" onClick={() => patchTheme({ logoAsset: null })}>{t("remove")}</Button>}</div></Field>
       <Field orientation="horizontal"><Switch checked={project.theme.showApplicationNames} onCheckedChange={value => patchTheme({ showApplicationNames: value })} /><FieldLabel>{locale === "de" ? "Anwendungsnamen" : "Application names"}</FieldLabel></Field>
       <Field orientation="horizontal"><Switch checked={project.theme.showTimestamps} onCheckedChange={value => patchTheme({ showTimestamps: value })} /><FieldLabel>{locale === "de" ? "Zeitstempel" : "Timestamps"}</FieldLabel></Field>
+      <Field orientation="horizontal"><Switch id="project-crumbtrail-branding" checked={project.theme.showCrumbtrailBranding} onCheckedChange={value => patchTheme({ showCrumbtrailBranding: value })} /><FieldLabel htmlFor="project-crumbtrail-branding">{locale === "de" ? "„Erstellt mit Crumbtrail“ anzeigen" : "Show “Created with Crumbtrail”"}</FieldLabel></Field>
       <Separator />
       <div className="flex items-center justify-between"><p className="text-sm font-semibold">{t("savedThemes")}</p><Button variant="outline" size="sm" onClick={() => setSaveOpen(true)}><Plus data-icon="inline-start" />{locale === "de" ? "Als Design speichern" : "Save as design"}</Button></div>
       <div className="grid gap-2">{designs.map(design => <div key={design.id} className="flex items-center gap-2 rounded-lg border p-2"><Button variant="ghost" className="min-w-0 flex-1 justify-start truncate" onClick={() => void applyDesign(design)}>{design.name}</Button><Button variant="ghost" size="icon-xs" onClick={() => setDesigns(deleteDesignTemplate(design.id))} aria-label={locale === "de" ? "Design löschen" : "Delete design"}><Trash2 /></Button></div>)}</div>
@@ -453,6 +497,20 @@ function ExportDialog({ open, onOpenChange, project }: { open: boolean; onOpenCh
     <div className="grid grid-cols-3 gap-2">{([['html', FileCode2, 'HTML'], ['pdf', FileText, 'PDF'], ['images', FileImage, locale === "de" ? 'Bilder' : 'Images']] as const).map(([value, Icon, label]) => <button key={value} onClick={() => setFormat(value)} className={cn("rounded-xl border p-4 text-left transition", format === value ? "border-breadcrumb bg-breadcrumb-soft/65" : "hover:bg-muted")}><Icon className="mb-4 text-breadcrumb" /><p className="text-sm font-semibold">{label}</p></button>)}</div>
     {format === "images" && <div className="grid gap-3"><Field orientation="horizontal"><Checkbox checked={annotated} onCheckedChange={value => setAnnotated(value === true)} /><FieldLabel>{locale === "de" ? "Bearbeitete Bilder" : "Annotated images"}</FieldLabel></Field><Field orientation="horizontal"><Checkbox checked={raw} onCheckedChange={value => setRaw(value === true)} /><FieldLabel>{locale === "de" ? "Originale einschließen" : "Include originals"}</FieldLabel></Field></div>}
   </div><DialogFooter><Button variant="outline" onClick={() => onOpenChange(false)}>{t("cancel")}</Button><Button onClick={run} disabled={busy}>{busy ? (locale === "de" ? "Exportiert…" : "Exporting…") : t("export")}<Download data-icon="inline-end" /></Button></DialogFooter></DialogContent></Dialog>
+}
+
+export function annotationRectForView(kind: AnnotationKind, view: NormalizedRect): NormalizedRect {
+  const local = kind === "clickMarker"
+    ? { x: .49, y: .49, width: .02, height: .02 }
+    : kind === "crop"
+      ? { x: .05, y: .05, width: .9, height: .9 }
+      : { x: .34, y: .34, width: .32, height: .2 }
+  return {
+    x: view.x + local.x * view.width,
+    y: view.y + local.y * view.height,
+    width: local.width * view.width,
+    height: local.height * view.height,
+  }
 }
 
 export function focusRect(step: Step, zoomPercent = 175): NormalizedRect {

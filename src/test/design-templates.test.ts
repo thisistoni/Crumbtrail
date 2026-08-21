@@ -10,6 +10,7 @@ describe("design templates", () => {
     project.author = "Ada Lovelace"
     project.description = "Operations handbook"
     project.theme.accent = "#b42318"
+    project.theme.showCrumbtrailBranding = false
     const template = designFromProject("Support", project, "data:image/png;base64,AA==")
     upsertDesignTemplate(template)
 
@@ -18,7 +19,7 @@ describe("design templates", () => {
       author: "Ada Lovelace",
       description: "Operations handbook",
       logoDataUrl: "data:image/png;base64,AA==",
-      theme: expect.objectContaining({ accent: "#b42318", logoAsset: null }),
+      theme: expect.objectContaining({ accent: "#b42318", logoAsset: null, showCrumbtrailBranding: false }),
     })])
   })
 
@@ -26,5 +27,14 @@ describe("design templates", () => {
     const project = createMockProject()
     localStorage.setItem("crumbtrail.theme-presets.v1", JSON.stringify([{ id: "legacy", name: "Legacy", theme: project.theme }]))
     expect(loadDesignTemplates()[0]).toEqual(expect.objectContaining({ id: "legacy", name: "Legacy", author: "", description: "" }))
+  })
+
+  it("shows Crumbtrail branding by default in older saved designs", () => {
+    const project = createMockProject()
+    const template = designFromProject("Older", project)
+    const theme = { ...template.theme } as Partial<typeof template.theme>
+    delete theme.showCrumbtrailBranding
+    localStorage.setItem("crumbtrail.design-templates.v1", JSON.stringify([{ ...template, theme }]))
+    expect(loadDesignTemplates()[0].theme.showCrumbtrailBranding).toBe(true)
   })
 })
