@@ -301,6 +301,8 @@ pub fn protect_window(window: tauri::WebviewWindow) -> Result<(), String> {
         unsafe { SetWindowDisplayAffinity(HWND(raw.0), WDA_EXCLUDEFROMCAPTURE) }
             .map_err(message)?;
     }
+    #[cfg(not(windows))]
+    let _ = window;
     Ok(())
 }
 

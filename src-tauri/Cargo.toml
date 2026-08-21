@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Create polished process guides while you work"
 authors = ["Crumbtrail contributors"]
 license = "MIT OR Apache-2.0"
-repository = ""
+repository = "https://github.com/thisistoni/Crumbtrail"
 edition = "2021"
 rust-version = "1.77.2"
 
@@ -45,6 +45,7 @@ zip = { version = "4", default-features = false, features = ["deflate"] }
 [target.'cfg(windows)'.dependencies]
 uiautomation = "0.25"
 windows-capture = "2.0.0"
+windows-icons = "0.4.0"
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",

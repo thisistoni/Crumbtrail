@@ -33,7 +33,7 @@ export function ScreenshotCanvas({ imageUrl, annotations, focusZoom, zoom, cropM
   const renderedAnnotations = useMemo(() => annotations.map(item => ({ ...item, ...drafts[item.id] })), [annotations, drafts])
   const crop = useMemo(() => [...renderedAnnotations].reverse().find(item => item.kind === "crop"), [renderedAnnotations])
   const view = cropMode ? FULL : crop?.rect ?? focusZoom ?? FULL
-  const selected = renderedAnnotations.find(item => item.id === selectedId) ?? null
+  const selected = renderedAnnotations.find(item => item.id === selectedId && item.kind !== "crop") ?? null
   const width = Math.max(280, 900 * zoom)
   const aspect = (imageSize.width * view.width) / (imageSize.height * view.height)
 
@@ -118,7 +118,7 @@ export function ScreenshotCanvas({ imageUrl, annotations, focusZoom, zoom, cropM
     <ContextMenu>
       <ContextMenuTrigger className="block">
         <div ref={stage} data-canvas-stage className="crumb-shadow relative shrink-0 overflow-hidden rounded-xl border bg-card" style={{ width, aspectRatio: aspect }} onPointerDown={() => onSelect(null)}>
-          {imageUrl ? <img src={imageUrl} alt="" className="pointer-events-none absolute select-none" draggable={false} onLoad={event => setImageSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} style={{ width: `${100 / view.width}%`, maxWidth: "none", height: "auto", left: `${-view.x / view.width * 100}%`, top: `${-view.y / view.height * 100}%` }} /> : <div className="flex h-full items-center justify-center text-sm text-muted-foreground">…</div>}
+          {imageUrl ? <img data-canvas-image src={imageUrl} alt="" className="pointer-events-none absolute select-none" draggable={false} onLoad={event => setImageSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} style={{ width: `${100 / view.width}%`, maxWidth: "none", height: "auto", left: `${-view.x / view.width * 100}%`, top: `${-view.y / view.height * 100}%` }} /> : <div className="flex h-full items-center justify-center text-sm text-muted-foreground">…</div>}
           {renderedAnnotations.filter(annotation => annotation.kind !== "crop" && intersects(annotation.rect, view)).sort((a, b) => a.zIndex - b.zIndex).map(annotation => {
             const rect = viewRect(annotation.rect)
             const isSelected = annotation.id === selectedId
@@ -144,11 +144,11 @@ export function ScreenshotCanvas({ imageUrl, annotations, focusZoom, zoom, cropM
 
 function AnnotationShape({ annotation, rect, selected, onPointerDown, onContextMenu, children }: { annotation: Annotation; rect: NormalizedRect; selected: boolean; onPointerDown(event: React.PointerEvent): void; onContextMenu(): void; children?: React.ReactNode }) {
   const style: React.CSSProperties = { left: `${rect.x * 100}%`, top: `${rect.y * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%`, color: annotation.color, opacity: annotation.opacity, transform: `rotate(${annotation.rotation}deg)`, zIndex: annotation.zIndex + 10 }
-  return <div className={cn("absolute cursor-move touch-none", selected && "outline outline-1 outline-offset-2 outline-blue-500", annotation.kind === "blur" && "bg-white/10 backdrop-blur-md")} style={style} onPointerDown={onPointerDown} onContextMenu={onContextMenu}>
+  return <div data-annotation-kind={annotation.kind} className={cn("absolute cursor-move touch-none", selected && "outline outline-1 outline-offset-2 outline-blue-500", annotation.kind === "blur" && "bg-white/10 backdrop-blur-md")} style={style} onPointerDown={onPointerDown} onContextMenu={onContextMenu}>
     {annotation.kind === "clickMarker" && <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border bg-current/20 shadow-[0_0_0_2px_rgba(255,255,255,.8)]" style={{ width: annotation.markerSize, height: annotation.markerSize, borderWidth: annotation.strokeWidth, borderColor: annotation.color }} />}
     {["elementOutline", "rectangle"].includes(annotation.kind) && <span className="absolute inset-0 rounded-sm border" style={{ borderWidth: annotation.strokeWidth, borderColor: annotation.color }} />}
-    {annotation.kind === "arrow" && <span className="absolute left-0 top-1/2 h-0.5 w-full -translate-y-1/2 bg-current after:absolute after:right-0 after:top-1/2 after:size-3 after:-translate-y-1/2 after:rotate-45 after:border-r-2 after:border-t-2 after:border-current" />}
-    {annotation.kind === "text" && <span className="absolute inset-0 flex items-center justify-center rounded-md bg-neutral-950/85 px-2 text-center text-xs font-semibold text-white shadow-lg">{annotation.label || "Text"}</span>}
+    {annotation.kind === "arrow" && <><span data-arrow-line className="absolute left-0 top-1/2 w-full -translate-y-1/2 bg-current" style={{ height: annotation.strokeWidth }} /><span className="absolute right-0 top-1/2 -translate-y-1/2 rotate-45 border-r border-t border-current" style={{ width: Math.max(10, annotation.strokeWidth * 2.5), height: Math.max(10, annotation.strokeWidth * 2.5), borderRightWidth: annotation.strokeWidth, borderTopWidth: annotation.strokeWidth }} /></>}
+    {annotation.kind === "text" && <span className="absolute inset-0 flex items-center justify-center rounded-md bg-neutral-950/85 px-2 text-center font-semibold shadow-lg" style={{ color: annotation.color, fontSize: annotation.markerSize }}>{annotation.label || "Text"}</span>}
     {children}
   </div>
 }

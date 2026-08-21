@@ -1,4 +1,5 @@
-use crate::models::{ProjectManifest, ProjectSummary, PROJECT_SCHEMA_VERSION};
+use crate::models::{ApplicationSummary, ProjectManifest, ProjectSummary, PROJECT_SCHEMA_VERSION};
+use std::collections::HashMap;
 use std::{
     fs::{self, File},
     io::{Cursor, Write},
@@ -48,9 +49,7 @@ impl StorageService {
     }
 
     pub fn create_project(&self, title: &str) -> StorageResult<ProjectManifest> {
-        let project = ProjectManifest::new(title.trim());
-        self.autosave(&project)?;
-        Ok(project)
+        Ok(ProjectManifest::new(title.trim()))
     }
 
     pub fn autosave(&self, project: &ProjectManifest) -> StorageResult<()> {
@@ -88,12 +87,17 @@ impl StorageService {
             if self.validate_manifest(&project).is_err() {
                 continue;
             }
+            if project.steps.is_empty() {
+                continue;
+            }
+            let applications = project_applications(&project);
             projects.push(ProjectSummary {
                 id: project.id,
                 title: project.title,
                 updated_at: project.updated_at,
                 step_count: project.steps.len(),
                 recoverable: true,
+                applications,
             });
         }
         projects.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -291,6 +295,9 @@ impl StorageService {
             assets.push(logo);
         }
         for step in &project.steps {
+            if let Some(asset) = step.application_icon_asset.as_deref() {
+                assets.push(asset);
+            }
             if let Some(asset) = step.media.before_asset.as_deref() {
                 assets.push(asset);
             }
@@ -329,6 +336,34 @@ impl StorageService {
         }
         Ok(self.session_dir(project_id)?.join(relative))
     }
+}
+
+fn project_applications(project: &ProjectManifest) -> Vec<ApplicationSummary> {
+    let mut positions = HashMap::<String, usize>::new();
+    let mut applications = Vec::<ApplicationSummary>::new();
+    for step in &project.steps {
+        let Some(name) = step
+            .application
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let key = name.to_lowercase();
+        if let Some(index) = positions.get(&key).copied() {
+            if applications[index].icon_asset.is_none() && step.application_icon_asset.is_some() {
+                applications[index].icon_asset = step.application_icon_asset.clone();
+            }
+            continue;
+        }
+        positions.insert(key, applications.len());
+        applications.push(ApplicationSummary {
+            name: name.to_string(),
+            icon_asset: step.application_icon_asset.clone(),
+        });
+    }
+    applications
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> StorageResult<()> {
@@ -440,6 +475,50 @@ mod tests {
     }
 
     #[test]
+    fn empty_drafts_are_not_listed_as_projects() {
+        let (_temp, storage) = service();
+        let mut project = storage.create_project("Untitled guide").unwrap();
+        assert!(storage.list_sessions().unwrap().is_empty());
+
+        let asset = storage
+            .write_asset(&project.id, "first.png", b"image")
+            .unwrap();
+        project.steps.push(crate::models::Step::manual(asset));
+        storage.autosave(&project).unwrap();
+
+        let sessions = storage.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].step_count, 1);
+    }
+
+    #[test]
+    fn project_summaries_deduplicate_applications_and_keep_icons() {
+        let (_temp, storage) = service();
+        let mut project = storage.create_project("Browser guide").unwrap();
+        let image = storage
+            .write_asset(&project.id, "first.png", b"image")
+            .unwrap();
+        let icon = storage
+            .write_asset(&project.id, "chrome-icon.png", b"icon")
+            .unwrap();
+        let mut first = crate::models::Step::manual(image.clone());
+        first.application = Some("chrome.exe".into());
+        let mut second = crate::models::Step::manual(image);
+        second.application = Some("Chrome.exe".into());
+        second.application_icon_asset = Some(icon.clone());
+        project.steps.extend([first, second]);
+        storage.autosave(&project).unwrap();
+
+        let sessions = storage.list_sessions().unwrap();
+        assert_eq!(sessions[0].applications.len(), 1);
+        assert_eq!(sessions[0].applications[0].name, "chrome.exe");
+        assert_eq!(
+            sessions[0].applications[0].icon_asset.as_deref(),
+            Some(icon.as_str())
+        );
+    }
+
+    #[test]
     fn rejects_newer_schema_without_changing_it() {
         let (_temp, storage) = service();
         let mut project = ProjectManifest::new("Future");
@@ -492,6 +571,7 @@ mod tests {
     fn ignores_interrupted_temporary_manifest_files() {
         let (_temp, storage) = service();
         let project = storage.create_project("Recover me").unwrap();
+        storage.autosave(&project).unwrap();
         let session = storage.session_dir(&project.id).unwrap();
         fs::write(session.join("manifest.interrupted.tmp"), b"not json").unwrap();
         assert_eq!(
@@ -504,6 +584,7 @@ mod tests {
     fn migrates_schema_one_in_memory_without_rewriting_the_session() {
         let (_temp, storage) = service();
         let project = storage.create_project("Legacy").unwrap();
+        storage.autosave(&project).unwrap();
         let manifest = storage
             .session_dir(&project.id)
             .unwrap()
@@ -515,11 +596,16 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("reportLocale");
+        value["theme"]
+            .as_object_mut()
+            .unwrap()
+            .remove("showCrumbtrailBranding");
         fs::write(&manifest, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 
         let migrated = storage.load_session(&project.id).unwrap();
         assert_eq!(migrated.schema_version, PROJECT_SCHEMA_VERSION);
         assert_eq!(migrated.theme.report_locale, "en");
+        assert!(migrated.theme.show_crumbtrail_branding);
 
         let unchanged: serde_json::Value =
             serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();

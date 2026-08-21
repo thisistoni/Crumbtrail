@@ -45,6 +45,8 @@ pub struct ThemeSettings {
     pub logo_asset: Option<String>,
     pub show_timestamps: bool,
     pub show_application_names: bool,
+    #[serde(default = "default_show_crumbtrail_branding")]
+    pub show_crumbtrail_branding: bool,
     #[serde(default = "default_report_locale")]
     pub report_locale: String,
 }
@@ -58,9 +60,14 @@ impl Default for ThemeSettings {
             logo_asset: None,
             show_timestamps: false,
             show_application_names: true,
+            show_crumbtrail_branding: default_show_crumbtrail_branding(),
             report_locale: default_report_locale(),
         }
     }
+}
+
+fn default_show_crumbtrail_branding() -> bool {
+    true
 }
 
 fn default_report_locale() -> String {
@@ -185,6 +192,14 @@ pub struct PixelRect {
     pub height: u32,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClickPulse {
+    pub x: i32,
+    pub y: i32,
+    pub right: bool,
+}
+
 impl PixelRect {
     pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.x
@@ -239,6 +254,8 @@ pub struct Step {
     pub created_at: String,
     pub included: bool,
     pub application: Option<String>,
+    #[serde(default)]
+    pub application_icon_asset: Option<String>,
     pub control: Option<ControlMetadata>,
     pub media: StepMedia,
     pub annotations: Vec<Annotation>,
@@ -256,6 +273,7 @@ impl Step {
             created_at: chrono::Utc::now().to_rfc3339(),
             included: true,
             application: None,
+            application_icon_asset: None,
             control: None,
             media: StepMedia {
                 before_asset: Some(asset),
@@ -359,6 +377,14 @@ pub struct ProjectSummary {
     pub updated_at: String,
     pub step_count: usize,
     pub recoverable: bool,
+    pub applications: Vec<ApplicationSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplicationSummary {
+    pub name: String,
+    pub icon_asset: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

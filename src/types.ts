@@ -9,6 +9,7 @@ export type ExportFormat = "html" | "pdf" | "images"
 export type AppLocale = "en" | "de"
 
 export interface PixelRect { x: number; y: number; width: number; height: number }
+export interface ClickPulse { x: number; y: number; right: boolean }
 export interface NormalizedRect { x: number; y: number; width: number; height: number }
 export interface CaptureTargetDescriptor { id: string; kind: CaptureTargetKind; label: string; bounds: PixelRect; scaleFactor: number }
 export interface RecordingOptions {
@@ -36,8 +37,10 @@ export interface ThemeSettings {
   logoAsset?: string | null
   showTimestamps: boolean
   showApplicationNames: boolean
+  showCrumbtrailBranding: boolean
   reportLocale: AppLocale
 }
+export type DesignThemeSettings = Omit<ThemeSettings, "reportLocale">
 export interface ControlMetadata {
   name: string
   controlType: string
@@ -66,6 +69,7 @@ export interface Step {
   createdAt: string
   included: boolean
   application?: string | null
+  applicationIconAsset?: string | null
   control?: ControlMetadata | null
   media: { beforeAsset?: string | null; afterAsset?: string | null; selected: MediaVariant }
   annotations: Annotation[]
@@ -83,7 +87,8 @@ export interface ProjectManifest {
   capture: RecordingOptions
   steps: Step[]
 }
-export interface ProjectSummary { id: string; title: string; updatedAt: string; stepCount: number; recoverable: boolean }
+export interface ApplicationSummary { name: string; iconAsset?: string | null }
+export interface ProjectSummary { id: string; title: string; updatedAt: string; stepCount: number; recoverable: boolean; applications: ApplicationSummary[] }
 export interface RecordingStateSnapshot {
   status: RecordingStatus
   projectId?: string | null
@@ -105,7 +110,7 @@ export interface DesignTemplate {
   name: string
   author: string
   description: string
-  theme: ThemeSettings
+  theme: DesignThemeSettings
   logoDataUrl?: string | null
   createdAt: string
   updatedAt: string

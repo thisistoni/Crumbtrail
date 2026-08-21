@@ -2,15 +2,16 @@ use super::{CaptureBackend, RecorderError, RecorderResult};
 use crate::{
     export::render_annotated_png,
     models::{
-        Annotation, AnnotationKind, CaptureTargetDescriptor, CaptureTargetKind, ControlMetadata,
-        MediaVariant, NormalizedRect, PixelRect, ProjectManifest, RecordingOptions,
-        RecordingStateSnapshot, RecordingStatus, Step, StepKind, StepMedia,
+        Annotation, AnnotationKind, CaptureTargetDescriptor, CaptureTargetKind, ClickPulse,
+        ControlMetadata, MediaVariant, NormalizedRect, PixelRect, ProjectManifest,
+        RecordingOptions, RecordingStateSnapshot, RecordingStatus, Step, StepKind, StepMedia,
     },
     storage::StorageService,
 };
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use parking_lot::Mutex;
 use std::{
+    collections::HashMap,
     io::Cursor,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -56,6 +57,7 @@ use windows_capture::{
     },
     window::Window,
 };
+use windows_icons::{get_icon_by_process_id_with_size, IconSize};
 
 #[derive(Clone)]
 struct FrameSnapshot {
@@ -450,6 +452,8 @@ impl CaptureBackend for WindowsCaptureBackend {
         let shared = Arc::clone(&self.shared);
         let source_for_worker = source.clone();
         let target_for_worker = target.clone();
+        let poll_app = app.clone();
+        let poll_options = options.clone();
         self.processor_thread = Some(thread::spawn(move || {
             process_events(
                 input_rx,
@@ -467,8 +471,9 @@ impl CaptureBackend for WindowsCaptureBackend {
         }));
 
         let poll_shared = Arc::clone(&self.shared);
+        let poll_state = Arc::clone(&self.state);
         self.input_poll_thread = Some(thread::spawn(move || {
-            poll_mouse_input(poll_tx, poll_shared)
+            poll_mouse_input(poll_tx, poll_shared, poll_app, poll_state, poll_options)
         }));
         self.hook_thread = Some(thread::spawn(install_hooks));
         Ok(snapshot)
@@ -744,7 +749,13 @@ fn install_hooks() {
     }
 }
 
-fn poll_mouse_input(sender: Sender<InputEvent>, shared: Arc<CaptureShared>) {
+fn poll_mouse_input(
+    sender: Sender<InputEvent>,
+    shared: Arc<CaptureShared>,
+    app: AppHandle,
+    state: Arc<Mutex<RecordingStateSnapshot>>,
+    options: RecordingOptions,
+) {
     let mut left_down = key_is_down(VK_LBUTTON.0 as i32);
     let mut right_down = key_is_down(VK_RBUTTON.0 as i32);
     while !shared.stop.load(Ordering::Relaxed) && !shared.closed.load(Ordering::Relaxed) {
@@ -752,17 +763,35 @@ fn poll_mouse_input(sender: Sender<InputEvent>, shared: Arc<CaptureShared>) {
         let next_right = key_is_down(VK_RBUTTON.0 as i32);
         if (next_left && !left_down) || (next_right && !right_down) {
             let mut point = POINT::default();
-            if unsafe { GetCursorPos(&mut point) }.is_ok()
-                && sender
+            if unsafe { GetCursorPos(&mut point) }.is_ok() {
+                let right = next_right && !right_down;
+                let snapshot = state.lock().clone();
+                if snapshot.status == RecordingStatus::Recording
+                    && snapshot.target.as_ref().is_some_and(|target| {
+                        should_capture_click(&target.bounds, point.x, point.y, right, &options)
+                    })
+                    && !point_belongs_to_crumbtrail(point.x, point.y)
+                {
+                    let _ = app.emit(
+                        "recording://click-pulse",
+                        ClickPulse {
+                            x: point.x,
+                            y: point.y,
+                            right,
+                        },
+                    );
+                }
+                if sender
                     .send(InputEvent::Click {
                         x: point.x,
                         y: point.y,
-                        right: next_right && !right_down,
+                        right,
                         at: Instant::now(),
                     })
                     .is_err()
-            {
-                break;
+                {
+                    break;
+                }
             }
         }
         left_down = next_left;
@@ -791,6 +820,7 @@ fn process_events(
 ) {
     let mut typing: Option<TypingGroup> = None;
     let mut last_click: Option<(Instant, i32, i32, bool)> = None;
+    let mut application_processes = HashMap::<String, (String, u32)>::new();
     loop {
         if state.lock().status == RecordingStatus::Paused {
             paused.store(true, Ordering::Relaxed);
@@ -830,6 +860,12 @@ fn process_events(
                     &target,
                     &shared,
                     &state,
+                );
+                schedule_application_icon_enrichment(
+                    app.clone(),
+                    storage.clone(),
+                    project_id.clone(),
+                    application_processes.clone(),
                 );
                 shared.stop.store(true, Ordering::Relaxed);
                 if let Ok(mut sender) = input_sender().lock() {
@@ -882,9 +918,10 @@ fn process_events(
                 } else {
                     "Describe this step".into()
                 };
-                step.application = Window::foreground()
-                    .ok()
-                    .and_then(|window| window.process_name().ok());
+                let application = foreground_application();
+                remember_application(&application, &mut application_processes);
+                step.application = application.name;
+                step.application_icon_asset = None;
                 match persist_frame(&storage, &project_id, &source, &target, &frame, None) {
                     Ok(asset) => {
                         step.media.before_asset = Some(asset);
@@ -929,6 +966,8 @@ fn process_events(
                 let Some(before) = latest_frame(&shared) else {
                     continue;
                 };
+                let application = foreground_application();
+                remember_application(&application, &mut application_processes);
                 let control = inspect_point_with_timeout(x, y, target.bounds);
                 let after = stable_after(&shared, &before, &options);
                 let redaction = control
@@ -990,9 +1029,6 @@ fn process_events(
                         })
                     })
                     .flatten();
-                let application = Window::foreground()
-                    .ok()
-                    .and_then(|window| window.process_name().ok());
                 append_step(
                     &app,
                     &storage,
@@ -1004,7 +1040,8 @@ fn process_events(
                         notes: String::new(),
                         created_at: chrono::Utc::now().to_rfc3339(),
                         included: true,
-                        application,
+                        application: application.name,
+                        application_icon_asset: None,
                         control,
                         media: StepMedia {
                             before_asset,
@@ -1044,11 +1081,14 @@ fn process_events(
                 }
                 if typing.is_none() {
                     if let Some(before) = latest_frame(&shared) {
+                        let application = foreground_application();
+                        remember_application(&application, &mut application_processes);
                         typing = Some(TypingGroup {
                             before,
                             control: focused,
                             focus_key,
                             last_event: Instant::now(),
+                            application,
                         });
                     }
                 } else if let Some(group) = typing.as_mut() {
@@ -1142,6 +1182,7 @@ struct TypingGroup {
     control: Option<ControlMetadata>,
     focus_key: String,
     last_event: Instant,
+    application: ForegroundApplication,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1210,9 +1251,6 @@ fn finalize_typing(
                 .map(|annotation| focus_rect(annotation.rect, options.default_focus_zoom_percent))
         })
         .flatten();
-    let application = Window::foreground()
-        .ok()
-        .and_then(|window| window.process_name().ok());
     append_step(
         app,
         storage,
@@ -1224,7 +1262,8 @@ fn finalize_typing(
             notes: String::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             included: true,
-            application,
+            application: group.application.name,
+            application_icon_asset: None,
             control: group.control,
             media: StepMedia {
                 before_asset,
@@ -1236,6 +1275,116 @@ fn finalize_typing(
         },
         state,
     );
+}
+
+struct ForegroundApplication {
+    name: Option<String>,
+    process_id: u32,
+}
+
+fn foreground_application() -> ForegroundApplication {
+    let Ok(window) = Window::foreground() else {
+        return ForegroundApplication {
+            name: None,
+            process_id: 0,
+        };
+    };
+    let name = window.process_name().ok();
+    let mut process_id = 0;
+    unsafe {
+        GetWindowThreadProcessId(
+            windows::Win32::Foundation::HWND(window.as_raw_hwnd()),
+            Some(&mut process_id),
+        )
+    };
+    ForegroundApplication { name, process_id }
+}
+
+fn remember_application(
+    application: &ForegroundApplication,
+    processes: &mut HashMap<String, (String, u32)>,
+) {
+    let Some(name) = application.name.as_deref().filter(|name| !name.is_empty()) else {
+        return;
+    };
+    if application.process_id == 0 {
+        return;
+    }
+    processes
+        .entry(name.to_lowercase())
+        .or_insert_with(|| (name.to_string(), application.process_id));
+}
+
+fn schedule_application_icon_enrichment(
+    app: AppHandle,
+    storage: StorageService,
+    project_id: String,
+    processes: HashMap<String, (String, u32)>,
+) {
+    if processes.is_empty() {
+        return;
+    }
+    thread::spawn(move || {
+        let mut icons = HashMap::<String, String>::new();
+        for (key, (_, process_id)) in processes {
+            if let Some(asset) = persist_application_icon(&storage, &project_id, process_id) {
+                icons.insert(key, asset);
+            }
+        }
+        if icons.is_empty() {
+            return;
+        }
+        let Ok(mut project) = storage.load_session(&project_id) else {
+            return;
+        };
+        if !attach_application_icons(&mut project, &icons) {
+            return;
+        }
+        project.updated_at = chrono::Utc::now().to_rfc3339();
+        if storage.autosave(&project).is_ok() {
+            let _ = app.emit("recording://project-updated", &project);
+        }
+    });
+}
+
+fn attach_application_icons(
+    project: &mut ProjectManifest,
+    icons: &HashMap<String, String>,
+) -> bool {
+    let mut changed = false;
+    for step in &mut project.steps {
+        let Some(asset) = step
+            .application
+            .as_deref()
+            .and_then(|name| icons.get(&name.to_lowercase()))
+        else {
+            continue;
+        };
+        if step.application_icon_asset.as_ref() != Some(asset) {
+            step.application_icon_asset = Some(asset.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn persist_application_icon(
+    storage: &StorageService,
+    project_id: &str,
+    process_id: u32,
+) -> Option<String> {
+    let icon = get_icon_by_process_id_with_size(process_id, IconSize::Large).ok()?;
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(icon)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .ok()?;
+    storage
+        .write_asset(
+            project_id,
+            &format!("application-{process_id}.png"),
+            encoded.get_ref(),
+        )
+        .ok()
 }
 
 fn inspect_point(x: i32, y: i32, target: &PixelRect) -> Option<ControlMetadata> {
@@ -1856,6 +2005,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let storage = StorageService::new(temporary.path().to_path_buf()).unwrap();
         let project = storage.create_project("Untitled guide").unwrap();
+        storage.autosave(&project).unwrap();
         let target = CaptureTargetDescriptor {
             id: "monitor:test".into(),
             kind: CaptureTargetKind::Monitor,
@@ -1922,5 +2072,24 @@ mod tests {
         maybe_name_project_from_step(&mut project, &step);
 
         assert_eq!(project.title, "Release checklist");
+    }
+
+    #[test]
+    fn post_recording_icon_enrichment_updates_matching_steps_only() {
+        let mut project = ProjectManifest::new("Browser guide");
+        let mut browser_step = Step::manual(String::new());
+        browser_step.application = Some("chrome.exe".into());
+        let mut editor_step = Step::manual(String::new());
+        editor_step.application = Some("notepad.exe".into());
+        project.steps.extend([browser_step, editor_step]);
+        let icons = HashMap::from([("chrome.exe".into(), "media/chrome.png".into())]);
+
+        assert!(attach_application_icons(&mut project, &icons));
+        assert_eq!(
+            project.steps[0].application_icon_asset.as_deref(),
+            Some("media/chrome.png")
+        );
+        assert!(project.steps[1].application_icon_asset.is_none());
+        assert!(!attach_application_icons(&mut project, &icons));
     }
 }
