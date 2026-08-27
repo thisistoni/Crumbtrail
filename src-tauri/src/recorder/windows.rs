@@ -398,7 +398,12 @@ impl CaptureBackend for WindowsCaptureBackend {
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| "Capture selection was cancelled".to_string())?;
                 let selected = describe_item(&picked.item, kind)?;
-                let capture = start_capture(picked, Arc::clone(&shared))?;
+                let NativeTarget::Window(hwnd) = selected.1 else {
+                    return Err("The selected item is not a capturable window.".to_string());
+                };
+                let window = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
+                drop(picked);
+                let capture = start_capture(window, Arc::clone(&shared))?;
                 Ok((selected, capture))
             })();
             let _ = result_tx.send(result);
