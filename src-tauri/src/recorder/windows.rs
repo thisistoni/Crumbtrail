@@ -173,9 +173,9 @@ pub(crate) fn capture_monitor_thumbnail(target_id: &str) -> RecorderResult<Vec<u
 
         if shared.closed.load(Ordering::Relaxed) {
             let stop_error = capture.stop().err().map(|error| error.to_string());
-            return Err(RecorderError::Platform(
-                stop_error.unwrap_or_else(|| "The display was closed before a preview frame arrived.".to_string()),
-            ));
+            return Err(RecorderError::Platform(stop_error.unwrap_or_else(|| {
+                "The display was closed before a preview frame arrived.".to_string()
+            })));
         }
 
         if Instant::now() >= deadline {
