@@ -46,9 +46,9 @@ use windows::{
     },
 };
 use windows_capture::{
-    capture::{CaptureControl, GraphicsCaptureApiHandler},
+    capture::{CaptureControl, GraphicsCaptureApiError, GraphicsCaptureApiHandler},
     frame::Frame,
-    graphics_capture_api::InternalCaptureControl,
+    graphics_capture_api::{Error as GraphicsCaptureError, InternalCaptureControl},
     graphics_capture_picker::GraphicsCapturePicker,
     monitor::Monitor,
     settings::{
@@ -133,21 +133,59 @@ fn bgra_to_rgba(pixels: &mut [u8]) {
     }
 }
 
-fn start_capture<T>(item: T, shared: Arc<CaptureShared>) -> Result<ActiveCapture, String>
+fn start_capture<T>(
+    item: T,
+    shared: Arc<CaptureShared>,
+    include_secondary_windows: bool,
+) -> Result<ActiveCapture, String>
 where
-    T: TryInto<GraphicsCaptureItemType> + Send + 'static,
+    T: TryInto<GraphicsCaptureItemType> + Clone + Send + 'static,
 {
-    let settings = Settings::new(
-        item,
+    let preferred_settings = Settings::new(
+        item.clone(),
         CursorCaptureSettings::WithoutCursor,
         DrawBorderSettings::WithoutBorder,
-        SecondaryWindowSettings::Include,
+        if include_secondary_windows {
+            SecondaryWindowSettings::Include
+        } else {
+            SecondaryWindowSettings::Default
+        },
         MinimumUpdateIntervalSettings::Custom(Duration::from_millis(50)),
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
-        CaptureFlags(shared),
+        CaptureFlags(Arc::clone(&shared)),
     );
-    FrameHandler::start_free_threaded(settings).map_err(|error| error.to_string())
+    match FrameHandler::start_free_threaded(preferred_settings) {
+        Ok(capture) => Ok(capture),
+        Err(error) if optional_capture_setting_is_unsupported(&error) => {
+            let compatible_settings = Settings::new(
+                item,
+                CursorCaptureSettings::Default,
+                DrawBorderSettings::Default,
+                SecondaryWindowSettings::Default,
+                MinimumUpdateIntervalSettings::Default,
+                DirtyRegionSettings::Default,
+                ColorFormat::Bgra8,
+                CaptureFlags(shared),
+            );
+            FrameHandler::start_free_threaded(compatible_settings)
+                .map_err(|error| error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn optional_capture_setting_is_unsupported(error: &GraphicsCaptureApiError<String>) -> bool {
+    matches!(
+        error,
+        GraphicsCaptureApiError::GraphicsCaptureApiError(
+            GraphicsCaptureError::CursorConfigUnsupported
+                | GraphicsCaptureError::BorderConfigUnsupported
+                | GraphicsCaptureError::SecondaryWindowsUnsupported
+                | GraphicsCaptureError::MinimumUpdateIntervalUnsupported
+                | GraphicsCaptureError::DirtyRegionUnsupported
+        )
+    )
 }
 
 fn capture_ended_error(capture: ActiveCapture) -> String {
@@ -160,7 +198,8 @@ fn capture_ended_error(capture: ActiveCapture) -> String {
 pub(crate) fn capture_monitor_thumbnail(target_id: &str) -> RecorderResult<Vec<u8>> {
     let monitor = resolve_monitor(target_id).map_err(RecorderError::Platform)?;
     let shared = Arc::new(CaptureShared::default());
-    let capture = start_capture(monitor, Arc::clone(&shared)).map_err(RecorderError::Platform)?;
+    let capture =
+        start_capture(monitor, Arc::clone(&shared), false).map_err(RecorderError::Platform)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     let frame = loop {
         if let Some(frame) = shared.latest.lock().clone() {
@@ -390,7 +429,7 @@ impl CaptureBackend for WindowsCaptureBackend {
                     })?;
                     let monitor = resolve_monitor(&target_id)?;
                     let selected = describe_monitor(monitor, kind)?;
-                    let capture = start_capture(monitor, Arc::clone(&shared))?;
+                    let capture = start_capture(monitor, Arc::clone(&shared), false)?;
                     return Ok((selected, capture));
                 }
 
@@ -403,7 +442,7 @@ impl CaptureBackend for WindowsCaptureBackend {
                 };
                 let window = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
                 drop(picked);
-                let capture = start_capture(window, Arc::clone(&shared))?;
+                let capture = start_capture(window, Arc::clone(&shared), true)?;
                 Ok((selected, capture))
             })();
             let _ = result_tx.send(result);
@@ -1846,6 +1885,25 @@ fn recoverable_error(app: &AppHandle, state: &Arc<Mutex<RecordingStateSnapshot>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_optional_capture_settings_are_retryable() {
+        for error in [
+            GraphicsCaptureError::CursorConfigUnsupported,
+            GraphicsCaptureError::BorderConfigUnsupported,
+            GraphicsCaptureError::SecondaryWindowsUnsupported,
+            GraphicsCaptureError::MinimumUpdateIntervalUnsupported,
+            GraphicsCaptureError::DirtyRegionUnsupported,
+        ] {
+            assert!(optional_capture_setting_is_unsupported(
+                &GraphicsCaptureApiError::GraphicsCaptureApiError(error)
+            ));
+        }
+
+        assert!(!optional_capture_setting_is_unsupported(
+            &GraphicsCaptureApiError::GraphicsCaptureApiError(GraphicsCaptureError::Unsupported)
+        ));
+    }
 
     #[test]
     fn native_bgra_frames_are_converted_to_rgba() {
