@@ -46,7 +46,7 @@ use windows::{
     },
 };
 use windows_capture::{
-    capture::GraphicsCaptureApiHandler,
+    capture::{CaptureControl, GraphicsCaptureApiHandler},
     frame::Frame,
     graphics_capture_api::InternalCaptureControl,
     graphics_capture_picker::GraphicsCapturePicker,
@@ -58,6 +58,8 @@ use windows_capture::{
     window::Window,
 };
 use windows_icons::{get_icon_by_process_id_with_size, IconSize};
+
+type ActiveCapture = CaptureControl<FrameHandler, String>;
 
 #[derive(Clone)]
 struct FrameSnapshot {
@@ -107,7 +109,8 @@ impl GraphicsCaptureApiHandler for FrameHandler {
         let width = frame.width();
         let height = frame.height();
         let buffer = frame.buffer().map_err(|error| error.to_string())?;
-        let rgba = buffer.as_nopadding_buffer(&mut self.scratch).to_vec();
+        let mut rgba = buffer.as_nopadding_buffer(&mut self.scratch).to_vec();
+        bgra_to_rgba(&mut rgba);
         let sequence = self.shared.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         *self.shared.latest.lock() = Some(FrameSnapshot {
             rgba,
@@ -124,9 +127,15 @@ impl GraphicsCaptureApiHandler for FrameHandler {
     }
 }
 
-fn run_capture<T>(item: T, shared: Arc<CaptureShared>) -> Result<(), String>
+fn bgra_to_rgba(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+}
+
+fn start_capture<T>(item: T, shared: Arc<CaptureShared>) -> Result<ActiveCapture, String>
 where
-    T: TryInto<GraphicsCaptureItemType>,
+    T: TryInto<GraphicsCaptureItemType> + Send + 'static,
 {
     let settings = Settings::new(
         item,
@@ -135,33 +144,53 @@ where
         SecondaryWindowSettings::Include,
         MinimumUpdateIntervalSettings::Custom(Duration::from_millis(50)),
         DirtyRegionSettings::Default,
-        ColorFormat::Rgba8,
+        ColorFormat::Bgra8,
         CaptureFlags(shared),
     );
-    FrameHandler::start(settings).map_err(|error| error.to_string())
+    FrameHandler::start_free_threaded(settings).map_err(|error| error.to_string())
+}
+
+fn capture_ended_error(capture: ActiveCapture) -> String {
+    match capture.wait() {
+        Ok(()) => "The Windows capture session ended before it produced a frame.".to_string(),
+        Err(error) => error.to_string(),
+    }
 }
 
 pub(crate) fn capture_monitor_thumbnail(target_id: &str) -> RecorderResult<Vec<u8>> {
     let monitor = resolve_monitor(target_id).map_err(RecorderError::Platform)?;
     let shared = Arc::new(CaptureShared::default());
-    let worker_shared = Arc::clone(&shared);
-    let worker = thread::spawn(move || run_capture(monitor, worker_shared));
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let capture = start_capture(monitor, Arc::clone(&shared)).map_err(RecorderError::Platform)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
     let frame = loop {
         if let Some(frame) = shared.latest.lock().clone() {
             break frame;
         }
-        if shared.closed.load(Ordering::Relaxed) || Instant::now() >= deadline {
-            shared.stop.store(true, Ordering::Relaxed);
-            let _ = worker.join();
+
+        if capture.is_finished() {
+            return Err(RecorderError::Platform(capture_ended_error(capture)));
+        }
+
+        if shared.closed.load(Ordering::Relaxed) {
+            let stop_error = capture.stop().err().map(|error| error.to_string());
             return Err(RecorderError::Platform(
-                "The display preview could not be captured.".to_string(),
+                stop_error.unwrap_or_else(|| "The display was closed before a preview frame arrived.".to_string()),
             ));
         }
+
+        if Instant::now() >= deadline {
+            let stop_error = capture.stop().err().map(|error| error.to_string());
+            return Err(RecorderError::Platform(stop_error.unwrap_or_else(|| {
+                "The display preview did not produce a frame within 5 seconds.".to_string()
+            })));
+        }
+
         thread::sleep(Duration::from_millis(25));
     };
     shared.stop.store(true, Ordering::Relaxed);
-    let _ = worker.join();
+    capture
+        .stop()
+        .map_err(|error| RecorderError::Platform(error.to_string()))?;
 
     let image = RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
         .ok_or_else(|| RecorderError::Platform("Invalid display preview frame.".to_string()))?;
@@ -267,7 +296,7 @@ pub struct WindowsCaptureBackend {
     paused: Arc<AtomicBool>,
     started_at: Option<Instant>,
     input_tx: Option<Sender<InputEvent>>,
-    capture_thread: Option<JoinHandle<()>>,
+    capture: Option<ActiveCapture>,
     hook_thread: Option<JoinHandle<()>>,
     input_poll_thread: Option<JoinHandle<()>>,
     processor_thread: Option<JoinHandle<()>>,
@@ -283,7 +312,7 @@ impl WindowsCaptureBackend {
             paused: Arc::new(AtomicBool::new(false)),
             started_at: None,
             input_tx: None,
-            capture_thread: None,
+            capture: None,
             hook_thread: None,
             input_poll_thread: None,
             processor_thread: None,
@@ -302,11 +331,25 @@ impl WindowsCaptureBackend {
         }
         snapshot
     }
+
+    fn stop_active_capture(&mut self) -> Result<(), String> {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        if let Some(capture) = self.capture.take() {
+            capture.stop().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for WindowsCaptureBackend {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for WindowsCaptureBackend {
+    fn drop(&mut self) {
+        let _ = self.stop_active_capture();
     }
 }
 
@@ -332,13 +375,14 @@ impl CaptureBackend for WindowsCaptureBackend {
         ) {
             return Err(RecorderError::AlreadyRecording);
         }
-        self.shared.stop.store(true, Ordering::Relaxed);
+        self.stop_active_capture()
+            .map_err(RecorderError::Platform)?;
         self.shared = Arc::new(CaptureShared::default());
         self.state.lock().status = RecordingStatus::Selecting;
 
         let shared = Arc::clone(&self.shared);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
-        self.capture_thread = Some(thread::spawn(move || {
+        thread::spawn(move || {
             let result = (|| -> Result<_, String> {
                 if kind != CaptureTargetKind::Window {
                     let target_id = target_id.ok_or_else(|| {
@@ -346,30 +390,21 @@ impl CaptureBackend for WindowsCaptureBackend {
                     })?;
                     let monitor = resolve_monitor(&target_id)?;
                     let selected = describe_monitor(monitor, kind)?;
-                    result_tx
-                        .send(Ok(selected))
-                        .map_err(|_| "Selection channel closed".to_string())?;
-                    return run_capture(monitor, Arc::clone(&shared));
+                    let capture = start_capture(monitor, Arc::clone(&shared))?;
+                    return Ok((selected, capture));
                 }
 
                 let picked = GraphicsCapturePicker::pick_item()
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| "Capture selection was cancelled".to_string())?;
                 let selected = describe_item(&picked.item, kind)?;
-                result_tx
-                    .send(Ok(selected))
-                    .map_err(|_| "Selection channel closed".to_string())?;
-                run_capture(picked, Arc::clone(&shared))
+                let capture = start_capture(picked, Arc::clone(&shared))?;
+                Ok((selected, capture))
             })();
-            if let Err(error) = result {
-                if !shared.stop.load(Ordering::Relaxed) {
-                    shared.closed.store(true, Ordering::Relaxed);
-                }
-                let _ = result_tx.send(Err(error));
-            }
-        }));
+            let _ = result_tx.send(result);
+        });
 
-        let (descriptor, native) = result_rx
+        let ((descriptor, native), capture) = result_rx
             .recv()
             .map_err(|_| RecorderError::Platform("Capture picker stopped unexpectedly".into()))?
             .map_err(|error| {
@@ -379,6 +414,7 @@ impl CaptureBackend for WindowsCaptureBackend {
                     RecorderError::Platform(error)
                 }
             })?;
+        self.capture = Some(capture);
         self.selected_source = Some(descriptor.clone());
         self.selected_native = Some(native);
         *self.state.lock() = RecordingStateSnapshot {
@@ -409,14 +445,23 @@ impl CaptureBackend for WindowsCaptureBackend {
             .ok_or(RecorderError::NoTarget)?;
         let native = self.selected_native.ok_or(RecorderError::NoTarget)?;
         let target = effective_target(&source, region)?;
-        let frame_deadline = Instant::now() + Duration::from_secs(2);
+        let frame_deadline = Instant::now() + Duration::from_secs(5);
         while self.shared.latest.lock().is_none() && Instant::now() < frame_deadline {
+            if self
+                .capture
+                .as_ref()
+                .is_some_and(ActiveCapture::is_finished)
+            {
+                let capture = self.capture.take().expect("capture session disappeared");
+                return Err(RecorderError::Platform(capture_ended_error(capture)));
+            }
             thread::sleep(Duration::from_millis(40));
         }
         if self.shared.latest.lock().is_none() {
-            return Err(RecorderError::Platform(
-                "The selected target has not produced a frame yet. Try again in a moment.".into(),
-            ));
+            let stop_error = self.stop_active_capture().err();
+            return Err(RecorderError::Platform(stop_error.unwrap_or_else(|| {
+                "The selected target did not produce a frame within 5 seconds.".into()
+            })));
         }
 
         let step_count = storage
@@ -532,11 +577,11 @@ impl CaptureBackend for WindowsCaptureBackend {
     fn stop(&mut self) -> RecorderResult<RecordingStateSnapshot> {
         let previous = self.snapshot();
         self.state.lock().status = RecordingStatus::Stopping;
+        let capture_error = self.stop_active_capture().err();
         let _ = self
             .input_tx
             .as_ref()
             .map(|sender| sender.send(InputEvent::Stop));
-        self.shared.stop.store(true, Ordering::Relaxed);
         self.paused.store(false, Ordering::Relaxed);
         self.input_tx = None;
         if let Ok(mut sender) = input_sender().lock() {
@@ -548,6 +593,9 @@ impl CaptureBackend for WindowsCaptureBackend {
             elapsed_ms: previous.elapsed_ms,
             ..RecordingStateSnapshot::default()
         };
+        if let Some(error) = capture_error {
+            return Err(RecorderError::Platform(error));
+        }
         Ok(self.snapshot())
     }
 
@@ -1793,6 +1841,15 @@ fn recoverable_error(app: &AppHandle, state: &Arc<Mutex<RecordingStateSnapshot>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_bgra_frames_are_converted_to_rgba() {
+        let mut pixels = vec![10, 20, 30, 255, 40, 50, 60, 128];
+
+        bgra_to_rgba(&mut pixels);
+
+        assert_eq!(pixels, vec![30, 20, 10, 255, 60, 50, 40, 128]);
+    }
 
     #[test]
     fn region_must_be_inside_source_with_negative_coordinates() {

@@ -47,6 +47,7 @@ export function RecordingSetup({ project, onBack, onProject, onStarted }: SetupP
   const [region, setRegion] = useState<PixelRect | null>(null)
   const [displayChoices, setDisplayChoices] = useState<CaptureTargetDescriptor[]>([])
   const [displayPreviews, setDisplayPreviews] = useState<Record<string, string>>({})
+  const [displayPreviewErrors, setDisplayPreviewErrors] = useState<Record<string, string>>({})
   const [displayPickerOpen, setDisplayPickerOpen] = useState(false)
   const [selecting, setSelecting] = useState(false)
   const [starting, setStarting] = useState(false)
@@ -68,13 +69,15 @@ export function RecordingSetup({ project, onBack, onProject, onStarted }: SetupP
         if (!displays.length) throw new Error(locale === "de" ? "Keine aktiven Bildschirme gefunden" : "No active displays were found")
         setDisplayChoices(displays)
         setDisplayPreviews({})
+        setDisplayPreviewErrors({})
         setDisplayPickerOpen(true)
         void Promise.all(displays.map(async display => {
           try {
             const preview = await bridge.targetThumbnail(display)
             setDisplayPreviews(current => ({ ...current, [display.id]: preview }))
-          } catch {
+          } catch (error) {
             setDisplayPreviews(current => ({ ...current, [display.id]: "" }))
+            setDisplayPreviewErrors(current => ({ ...current, [display.id]: String(error) }))
           }
         }))
         return
@@ -193,7 +196,7 @@ export function RecordingSetup({ project, onBack, onProject, onStarted }: SetupP
             {displayChoices.map(display => (
               <Button key={display.id} variant="outline" className="h-auto min-w-0 flex-col items-stretch gap-0 overflow-hidden p-0 text-left" onClick={() => chooseDisplay(display)}>
                 <span className="aspect-video w-full overflow-hidden bg-muted">
-                  {displayPreviews[display.id] ? <img src={displayPreviews[display.id]} alt="" className="size-full object-cover" /> : <span className="flex size-full items-center justify-center"><LoaderCircle className="animate-spin text-muted-foreground" /></span>}
+                  {displayPreviews[display.id] ? <img src={displayPreviews[display.id]} alt="" className="size-full object-cover" /> : displayPreviewErrors[display.id] ? <span className="flex size-full items-center justify-center px-4 text-center text-sm text-muted-foreground" title={displayPreviewErrors[display.id]}>{locale === "de" ? "Vorschau nicht verfügbar" : "Preview unavailable"}</span> : <span className="flex size-full items-center justify-center"><LoaderCircle className="animate-spin text-muted-foreground" /></span>}
                 </span>
                 <span className="flex min-w-0 items-center justify-between gap-3 border-t px-4 py-3">
                   <span className="flex min-w-0 items-center gap-2"><Monitor className="size-4 shrink-0" /><span className="truncate font-medium">{display.label}</span></span>
