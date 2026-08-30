@@ -268,6 +268,16 @@ describe("Crumbtrail experience", () => {
     expect(screen.getAllByRole("button", { name: /start recording/i }).at(-1)).toBeEnabled()
   })
 
+  it("shows failed display previews instead of leaving them loading", async () => {
+    const user = userEvent.setup(); const project = createMockProject(); project.steps = []
+    vi.spyOn(bridge, "targetThumbnail").mockRejectedValue(new Error("No frame arrived"))
+    render(providers(<RecordingSetup project={project} onBack={vi.fn()} onProject={vi.fn()} onStarted={vi.fn()} />))
+
+    await user.click(screen.getByRole("button", { name: "Choose source" }))
+
+    expect(await screen.findAllByText("Preview unavailable")).toHaveLength(2)
+  })
+
   it("edits instructions and creates non-destructive annotations", async () => {
     const user = userEvent.setup(); const project = createMockProject(); const onProject = vi.fn()
     const { rerender } = render(providers(<Editor project={project} onProject={onProject} onHome={vi.fn()} onRecord={vi.fn()} />))
