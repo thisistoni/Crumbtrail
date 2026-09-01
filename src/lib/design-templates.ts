@@ -85,6 +85,7 @@ function designTheme(theme: DesignTemplate["theme"] | ThemeSettings): DesignTemp
     logoAsset: null,
     showTimestamps: theme.showTimestamps,
     showApplicationNames: theme.showApplicationNames,
+    showIcons: theme.showIcons !== false,
     showCrumbtrailBranding: theme.showCrumbtrailBranding !== false,
   }
 }

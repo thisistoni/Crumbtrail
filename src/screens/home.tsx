@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
 import { useTheme } from "next-themes"
-import { ArrowRight, FileArchive, FolderKanban, FolderOpen, Languages, LoaderCircle, Moon, MoreHorizontal, Palette, Pencil, Plus, Settings, Sun } from "lucide-react"
+import { ArrowRight, FileArchive, FolderKanban, FolderOpen, Languages, LoaderCircle, Moon, MoreHorizontal, Palette, Pencil, Plus, Settings, Sun, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 import { ApplicationIcon } from "@/components/application-icon"
 import { AvatarGroup, AvatarGroupTooltip } from "@/components/animate-ui/components/animate/avatar-group"
@@ -12,7 +12,8 @@ import { ProjectFolder } from "@/components/project-folder"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardAction, CardHeader, CardTitle } from "@/components/ui/card"
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { ContextMenu, ContextMenuContent, ContextMenuGroup, ContextMenuItem, ContextMenuTrigger } from "@/components/ui/context-menu"
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { Empty, EmptyContent, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty"
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
@@ -148,8 +149,10 @@ export function Home({ onOpen, onNew }: HomeProps) {
 
 function ProjectCard({ project, locale, dark, onOpen, onChanged }: { project: ProjectSummary; locale: "en" | "de"; dark: boolean; onOpen(project: ProjectManifest): void; onChanged(): void }) {
   const [renameOpen, setRenameOpen] = useState(false)
+  const [removeOpen, setRemoveOpen] = useState(false)
   const [title, setTitle] = useState(project.title)
   const [renaming, setRenaming] = useState(false)
+  const [removing, setRemoving] = useState(false)
   const openProject = () => bridge.loadSession(project.id).then(onOpen).catch(error => toast.error(String(error)))
   const openRename = () => {
     setTitle(project.title)
@@ -170,40 +173,69 @@ function ProjectCard({ project, locale, dark, onOpen, onChanged }: { project: Pr
       setRenaming(false)
     }
   }
+  async function removeProject() {
+    if (removing) return
+    setRemoving(true)
+    try {
+      await bridge.deleteSession(project.id)
+      setRemoveOpen(false)
+      onChanged()
+      toast.success(locale === "de" ? "Projekt in den Papierkorb verschoben" : "Project moved to Trash", {
+        action: {
+          label: locale === "de" ? "Rückgängig" : "Undo",
+          onClick: () => void bridge.restoreSession(project.id).then(onChanged).catch(error => toast.error(locale === "de" ? "Projekt konnte nicht wiederhergestellt werden" : "Could not restore the project", { description: String(error) })),
+        },
+      })
+    } catch (error) {
+      toast.error(locale === "de" ? "Projekt konnte nicht entfernt werden" : "Could not remove the project", { description: String(error) })
+    } finally {
+      setRemoving(false)
+    }
+  }
   return (
     <>
-      <Card
-        role="button"
-        tabIndex={0}
-        data-project-card
-        className="group gap-0 overflow-hidden p-0 transition-colors hover:bg-muted hover:ring-breadcrumb/45"
-        onClick={() => void openProject()}
-        onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); void openProject() } }}
-      >
-        <CardHeader className="relative grid min-h-32 grid-cols-[auto_1fr] items-center gap-7 px-5 py-5 pr-12">
-          <ProjectFolder projectId={project.id} applications={project.applications ?? []} dark={dark} />
-          <div className="min-w-0 flex-1">
-            <CardTitle className="line-clamp-2 text-base leading-5">{project.title || (locale === "de" ? "Unbenannte Anleitung" : "Untitled guide")}</CardTitle>
-            <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
-              <span>{project.stepCount} {project.stepCount === 1 ? (locale === "de" ? "Schritt" : "step") : (locale === "de" ? "Schritte" : "steps")}</span>
-              <span aria-hidden="true">·</span>
-              <span>{relativeDate(project.updatedAt, locale)}</span>
+      <ContextMenu>
+        <ContextMenuTrigger render={
+          <Card
+            role="button"
+            tabIndex={0}
+            data-project-card
+            className="group relative gap-0 overflow-hidden p-0 transition-colors hover:bg-muted hover:ring-breadcrumb/45"
+            onClick={() => void openProject()}
+            onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); void openProject() } }}
+          />
+        }>
+          <CardHeader className="relative grid min-h-32 grid-cols-[auto_1fr] items-center gap-7 px-5 py-5 pr-12">
+            <ProjectFolder projectId={project.id} applications={project.applications ?? []} dark={dark} />
+            <div className="min-w-0 flex-1">
+              <CardTitle className="line-clamp-2 text-base leading-5">{project.title || (locale === "de" ? "Unbenannte Anleitung" : "Untitled guide")}</CardTitle>
+              <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+                <span>{project.stepCount} {project.stepCount === 1 ? (locale === "de" ? "Schritt" : "step") : (locale === "de" ? "Schritte" : "steps")}</span>
+                <span aria-hidden="true">·</span>
+                <span>{relativeDate(project.updatedAt, locale)}</span>
+              </div>
             </div>
-          </div>
+            <ArrowRight className="absolute bottom-5 right-5 size-3.5 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
+          </CardHeader>
           <CardAction data-project-menu className="absolute right-4 top-4">
             <DropdownMenu>
               <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label={locale === "de" ? "Projektmenü" : "Project menu"} onClick={event => event.stopPropagation()} />}><MoreHorizontal /></DropdownMenuTrigger>
               <DropdownMenuContent align="end" onClick={event => event.stopPropagation()}>
                 <DropdownMenuGroup>
                   <DropdownMenuItem onClick={openRename}><Pencil />{locale === "de" ? "Umbenennen" : "Rename"}</DropdownMenuItem>
-                  <DropdownMenuItem variant="destructive" onClick={() => void bridge.deleteSession(project.id).then(onChanged)}>{locale === "de" ? "Entfernen" : "Remove"}</DropdownMenuItem>
+                  <DropdownMenuItem variant="destructive" onClick={() => setRemoveOpen(true)}><Trash2 />{locale === "de" ? "Entfernen" : "Remove"}</DropdownMenuItem>
                 </DropdownMenuGroup>
               </DropdownMenuContent>
             </DropdownMenu>
           </CardAction>
-          <ArrowRight className="absolute bottom-5 right-5 size-3.5 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
-        </CardHeader>
-      </Card>
+        </ContextMenuTrigger>
+        <ContextMenuContent onClick={event => event.stopPropagation()}>
+          <ContextMenuGroup>
+            <ContextMenuItem onClick={openRename}><Pencil />{locale === "de" ? "Umbenennen" : "Rename"}</ContextMenuItem>
+            <ContextMenuItem variant="destructive" onClick={() => setRemoveOpen(true)}><Trash2 />{locale === "de" ? "Entfernen" : "Remove"}</ContextMenuItem>
+          </ContextMenuGroup>
+        </ContextMenuContent>
+      </ContextMenu>
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent>
           <form className="contents" onSubmit={event => { event.preventDefault(); void renameProject() }}>
@@ -219,6 +251,18 @@ function ProjectCard({ project, locale, dark, onOpen, onChanged }: { project: Pr
               <Button type="submit" disabled={!title.trim() || renaming}>{renaming ? (locale === "de" ? "Wird umbenannt…" : "Renaming…") : (locale === "de" ? "Umbenennen" : "Rename")}</Button>
             </DialogFooter>
           </form>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={removeOpen} onOpenChange={setRemoveOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{locale === "de" ? `„${project.title}“ entfernen?` : `Remove “${project.title}”?`}</DialogTitle>
+            <DialogDescription>{locale === "de" ? "Das Projekt wird in den Papierkorb verschoben und kann direkt rückgängig gemacht werden." : "The project will be moved to Trash and can be undone immediately."}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRemoveOpen(false)}>{locale === "de" ? "Abbrechen" : "Cancel"}</Button>
+            <Button variant="destructive" onClick={() => void removeProject()} disabled={removing}>{removing ? (locale === "de" ? "Wird entfernt…" : "Removing…") : (locale === "de" ? "In Papierkorb" : "Move to Trash")}</Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </>

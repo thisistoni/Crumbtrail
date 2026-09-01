@@ -49,6 +49,8 @@ pub fn run() {
             commands::list_sessions,
             commands::load_session,
             commands::delete_session,
+            commands::restore_session,
+            commands::compact_session,
             commands::open_project,
             commands::save_project,
             commands::replace_image,
@@ -70,4 +72,18 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn editor_close_can_destroy_the_window_after_flushing() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let permissions = capability["permissions"].as_array().unwrap();
+
+        assert!(permissions
+            .iter()
+            .any(|permission| permission == "core:window:allow-destroy"));
+    }
 }

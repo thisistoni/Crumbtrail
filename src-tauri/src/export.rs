@@ -1,7 +1,7 @@
 use crate::{
     models::{
         Annotation, AnnotationKind, ExportFormat, ExportRequest, ExportResult, NormalizedRect,
-        ProjectManifest, ReportTheme,
+        ProjectManifest, ReportTheme, StepKind,
     },
     storage::{StorageError, StorageService},
 };
@@ -292,7 +292,7 @@ fn render_html_with_mode(
             },
             None => format!("<div class=\"missing\">{no_screenshot}</div>"),
         };
-        let application = if project.theme.show_application_names {
+        let application = if project.theme.show_application_names && step.kind != StepKind::Manual {
             step.application
                 .as_ref()
                 .filter(|value| !value.is_empty())
@@ -311,20 +311,30 @@ fn render_html_with_mode(
         } else {
             format!("<p class=\"notes\">{}</p>", escape(&step.notes))
         };
-        let marker = step
-            .application_icon_asset
-            .as_deref()
-            .and_then(|asset| storage.read_asset(&project.id, asset).ok())
-            .map(|bytes| {
-                let application_name = step.application.as_deref().unwrap_or_default();
-                format!(
-                    "<div class=\"step-marker\"><img src=\"data:image/png;base64,{}\" alt=\"{}\"><span>{}</span></div>",
-                    STANDARD.encode(bytes),
-                    escape(application_name),
-                    index + 1,
-                )
-            })
-            .unwrap_or_else(|| format!("<div class=\"step-number\">{}</div>", index + 1));
+        let marker = if !project.theme.show_icons || !step.show_icon {
+            format!("<div class=\"step-number\">{}</div>", index + 1)
+        } else if step.kind == StepKind::Manual
+            && (step.application.is_some() || step.application_icon_asset.is_none())
+        {
+            format!(
+                "<div class=\"step-marker snapshot-marker\" aria-label=\"Snapshot\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M14.5 6 13 4h-2L9.5 6H6a3 3 0 0 0-3 3v8a3 3 0 0 0 3 3h12a3 3 0 0 0 3-3V9a3 3 0 0 0-3-3h-3.5ZM12 17a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm0-2a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z\"/></svg><span>{}</span></div>",
+                index + 1,
+            )
+        } else {
+            step.application_icon_asset
+                .as_deref()
+                .and_then(|asset| storage.read_asset(&project.id, asset).ok())
+                .map(|bytes| {
+                    let application_name = step.application.as_deref().unwrap_or_default();
+                    format!(
+                        "<div class=\"step-marker\"><img src=\"data:image/png;base64,{}\" alt=\"{}\"><span>{}</span></div>",
+                        STANDARD.encode(bytes),
+                        escape(application_name),
+                        index + 1,
+                    )
+                })
+                .unwrap_or_else(|| format!("<div class=\"step-number\">{}</div>", index + 1))
+        };
         steps.push_str(&format!(
             "<li class=\"step\">{}<article><div class=\"meta\">{}{}</div><h2>{}</h2>{}<figure>{}</figure></article></li>",
             marker,
@@ -432,7 +442,7 @@ fn render_html_with_mode(
 .page{{width:min(1040px,calc(100% - 48px));min-height:100vh;margin:32px auto;padding:72px 64px;background:var(--paper);box-shadow:0 24px 70px rgba(35,31,22,.12)}}header{{padding-bottom:34px;border-bottom:3px solid var(--accent)}}
 .logo{{display:block;max-width:180px;max-height:60px;object-fit:contain;margin-bottom:24px}}h1{{max-width:820px;font-size:44px;line-height:1.06;letter-spacing:-.04em;margin:0}}.subtitle{{max-width:720px;margin:18px 0 0;color:var(--muted);font-size:18px;line-height:1.55}}
 .report-meta{{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:24px;color:var(--muted);font-size:13px;font-weight:600;letter-spacing:.02em}}.author{{padding-left:18px;border-left:1px solid var(--line)}}ol{{list-style:none;padding:0;margin:56px 0 0;display:grid;gap:52px}}.step{{display:grid;grid-template-columns:44px minmax(0,1fr);gap:22px;break-inside:avoid}}.step article{{min-width:0}}
-.step-number,.step-marker{{width:36px;height:36px;display:grid;place-items:center;font-weight:700}}.step-number{{border-radius:999px;background:#fff;color:#25231f;border:1px solid #dedad1;box-shadow:0 1px 3px rgba(20,17,10,.12)}}.step-marker{{position:relative;border-radius:10px;background:var(--panel);border:1px solid var(--line)}}.step-marker img{{width:26px;height:26px;object-fit:contain}}.step-marker span{{position:absolute;right:-5px;bottom:-5px;min-width:17px;height:17px;padding:0 4px;border-radius:999px;display:grid;place-items:center;background:#fff;color:#25231f;border:2px solid var(--paper);box-shadow:0 0 0 1px var(--line);font-size:10px;line-height:1}}
+.step-number,.step-marker{{width:36px;height:36px;display:grid;place-items:center;font-weight:700}}.step-number{{border-radius:999px;background:#fff;color:#25231f;border:1px solid #dedad1;box-shadow:0 1px 3px rgba(20,17,10,.12)}}.step-marker{{position:relative;border-radius:10px;background:var(--panel);border:1px solid var(--line)}}.step-marker img{{width:26px;height:26px;object-fit:contain}}.step-marker svg{{width:22px;height:22px;fill:currentColor}}.step-marker span{{position:absolute;right:-5px;bottom:-5px;min-width:17px;height:17px;padding:0 4px;border-radius:999px;display:grid;place-items:center;background:#fff;color:#25231f;border:2px solid var(--paper);box-shadow:0 0 0 1px var(--line);font-size:10px;line-height:1}}
 h2{{font-size:24px;line-height:1.25;letter-spacing:-.015em;margin:4px 0 10px}}.meta{{display:flex;flex-wrap:wrap;gap:8px 14px;color:var(--muted);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.065em}}
 .notes{{max-width:760px;margin:0 0 18px;color:var(--muted)}}figure{{margin:20px 0 0;background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:0 14px 40px rgba(20,17,10,.08)}}figure img{{display:block;width:100%;height:auto;max-height:720px;object-fit:contain;background:var(--soft)}}
 .missing,.empty{{padding:48px;text-align:center;color:var(--muted)}}footer{{display:flex;align-items:center;gap:9px;margin-top:56px;border-top:1px solid var(--line);padding-top:24px;color:var(--muted);font-size:13px}}.crumbtrail-mark{{width:24px;height:24px;flex:none;object-fit:contain}}
@@ -923,8 +933,19 @@ mod tests {
         assert!(html.contains("&lt;script&gt;alert(1)&lt;&#x2F;script&gt;"));
         assert!(!html.contains("<script>alert(1)</script>"));
         assert!(html.contains("data:image/png;base64,"));
-        assert!(html.contains("class=\"step-marker\""));
-        assert!(html.contains("alt=\"Crumbtrail Test App\""));
+        assert!(html.contains("class=\"step-marker snapshot-marker\""));
+        assert!(html.contains("aria-label=\"Snapshot\""));
+        assert!(!html.contains("Crumbtrail Test App"));
+
+        project.theme.show_icons = false;
+        let (without_design_icons, _) = render_html(&storage, &project).unwrap();
+        assert!(!without_design_icons.contains("snapshot-marker"));
+        assert!(without_design_icons.contains("class=\"step-number\""));
+        project.theme.show_icons = true;
+        project.steps[0].show_icon = false;
+        let (without_step_icon, _) = render_html(&storage, &project).unwrap();
+        assert!(!without_step_icon.contains("snapshot-marker"));
+        assert!(without_step_icon.contains("class=\"step-number\""));
 
         let (pdf_html, pdf_warnings) =
             render_html_with_mode(&storage, &project, ReportImageMode::PdfJpeg).unwrap();

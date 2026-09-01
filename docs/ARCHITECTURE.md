@@ -39,7 +39,7 @@ Portable `.crumbtrail` files are ZIP archives. Extraction is isolated and valida
 - A short in-memory buffer with pre-action and visually stable post-action candidates.
 - Redaction before persistence whenever UI Automation identifies a password control.
 
-Ordinary key codes are discarded at the hook boundary. Entered text is never constructed or stored.
+Ordinary key codes and entered characters are discarded at the hook boundary. The manifest stores only that a text-entry interaction occurred; captured screenshots can still contain text visible on screen.
 
 ## Export
 

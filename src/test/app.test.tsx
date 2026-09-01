@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { useState } from "react"
 import userEvent from "@testing-library/user-event"
 import { ThemeProvider } from "next-themes"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
@@ -15,7 +16,17 @@ import { annotationRectForView, Editor, focusRect } from "@/screens/editor"
 import { Home } from "@/screens/home"
 import { RecordingSetup } from "@/screens/recording-setup"
 import { clickPulsePosition } from "@/screens/recording-overlay"
+import { optimisticManualStepCount, RecordingHud } from "@/screens/recording-hud"
 import type { ProjectSummary } from "@/types"
+
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    show: () => Promise.resolve(),
+    close: () => Promise.resolve(),
+    destroy: () => Promise.resolve(),
+    onCloseRequested: () => Promise.resolve(() => undefined),
+  }),
+}))
 
 function providers(node: React.ReactNode) {
   return <ThemeProvider attribute="class"><LocaleProvider><SettingsProvider><TooltipProvider>{node}</TooltipProvider></SettingsProvider></LocaleProvider></ThemeProvider>
@@ -24,6 +35,23 @@ function providers(node: React.ReactNode) {
 describe("Crumbtrail experience", () => {
   beforeEach(() => localStorage.clear())
   afterEach(() => { cleanup(); vi.restoreAllMocks() })
+
+  it("acknowledges one pending manual snapshot without double-counting its completion", () => {
+    expect(optimisticManualStepCount(4, null)).toBe(4)
+    expect(optimisticManualStepCount(4, 4)).toBe(5)
+    expect(optimisticManualStepCount(5, 4)).toBe(5)
+  })
+
+  it("stretches both recording HUD separators across the control", () => {
+    const { container } = render(providers(<RecordingHud />))
+    const separators = container.querySelectorAll("[data-hud-separator]")
+
+    expect(separators).toHaveLength(2)
+    separators.forEach(separator => {
+      expect(separator).toHaveClass("data-vertical:self-stretch")
+      expect(separator).not.toHaveClass("h-8")
+    })
+  })
 
   it("opens with structured project and design navigation", async () => {
     render(<App />)
@@ -72,7 +100,7 @@ describe("Crumbtrail experience", () => {
     expect(Number.parseFloat((folder as HTMLElement).style.width)).toBeGreaterThan(100)
     expect(folderApps).toHaveLength(6)
     expect(container.querySelector("[data-project-menu]")).toHaveClass("absolute", "right-4", "top-4")
-    expect(container.querySelector("[data-project-card]")).toHaveClass("hover:bg-muted")
+    expect(container.querySelector("[data-project-card]")).toHaveClass("relative", "hover:bg-muted")
     expect(screen.getByRole("button", { name: "Projects" })).toHaveClass("hover:bg-breadcrumb-soft")
     expect(screen.getByText("+1")).toBeInTheDocument()
   })
@@ -126,6 +154,49 @@ describe("Crumbtrail experience", () => {
     expect(await screen.findByText("Renamed project")).toBeInTheDocument()
   })
 
+  it("opens the project actions where the card is right-clicked", async () => {
+    const project = createMockProject("Context menu guide")
+    vi.spyOn(bridge, "listSessions").mockResolvedValue([{
+      id: project.id,
+      title: project.title,
+      updatedAt: project.updatedAt,
+      stepCount: project.steps.length,
+      recoverable: true,
+      applications: [],
+    }])
+    const { container } = render(providers(<Home onOpen={vi.fn()} onNew={vi.fn()} />))
+
+    await screen.findByText("Context menu guide")
+    fireEvent.contextMenu(container.querySelector("[data-project-card]")!, { clientX: 240, clientY: 180 })
+
+    expect(await screen.findByRole("menuitem", { name: "Rename" })).toBeInTheDocument()
+    expect(screen.getByRole("menuitem", { name: "Remove" })).toBeInTheDocument()
+  })
+
+  it("confirms before moving a project to recoverable Trash", async () => {
+    const user = userEvent.setup()
+    const project = createMockProject("Disposable guide")
+    vi.spyOn(bridge, "listSessions").mockResolvedValue([{
+      id: project.id,
+      title: project.title,
+      updatedAt: project.updatedAt,
+      stepCount: project.steps.length,
+      recoverable: true,
+      applications: [],
+    }])
+    const remove = vi.spyOn(bridge, "deleteSession").mockResolvedValue()
+    render(providers(<Home onOpen={vi.fn()} onNew={vi.fn()} />))
+
+    await screen.findByText("Disposable guide")
+    await user.click(screen.getByRole("button", { name: "Project menu" }))
+    await user.click(await screen.findByRole("menuitem", { name: "Remove" }))
+
+    expect(remove).not.toHaveBeenCalled()
+    expect(screen.getByRole("heading", { name: "Remove “Disposable guide”?" })).toBeInTheDocument()
+    await user.click(screen.getByRole("button", { name: "Move to Trash" }))
+    await waitFor(() => expect(remove).toHaveBeenCalledWith(project.id))
+  })
+
   it("renders the global auto-focus zoom percentage control", async () => {
     const user = userEvent.setup()
     render(<App />)
@@ -144,6 +215,28 @@ describe("Crumbtrail experience", () => {
     expect(screen.getByLabelText("Project title")).toBeInTheDocument()
     await user.click(screen.getByRole("button", { name: "Back" }))
     expect(screen.getByRole("heading", { name: /leave a trail/i })).toBeInTheDocument()
+  })
+
+  it("flushes the latest editor change before navigating back", async () => {
+    const user = userEvent.setup()
+    const project = createMockProject()
+    let finishSave: ((saved: typeof project) => void) | undefined
+    const autosave = vi.spyOn(bridge, "autosave").mockImplementation(() => new Promise(resolve => { finishSave = resolve }))
+    const onHome = vi.fn()
+
+    function Harness() {
+      const [current, setCurrent] = useState(project)
+      return <Editor project={current} onProject={setCurrent} onHome={onHome} onRecord={vi.fn()} />
+    }
+
+    render(providers(<Harness />))
+    fireEvent.change(screen.getByLabelText("Project title"), { target: { value: "Latest title" } })
+    await user.click(screen.getByRole("button", { name: "Back" }))
+
+    expect(autosave).toHaveBeenCalledWith(expect.objectContaining({ title: "Latest title" }))
+    expect(onHome).not.toHaveBeenCalled()
+    finishSave?.({ ...project, title: "Latest title" })
+    await waitFor(() => expect(onHome).toHaveBeenCalledOnce())
   })
 
   it("opens target selection immediately for a new guide", async () => {
@@ -195,6 +288,7 @@ describe("Crumbtrail experience", () => {
 
     await user.click(screen.getByRole("button", { name: "Appearance" }))
     const branding = await screen.findByRole("switch", { name: "Show “Created with Crumbtrail”" })
+    expect(screen.getByRole("switch", { name: "Step icons" })).toBeChecked()
     expect(branding).toBeChecked()
     await user.click(branding)
     expect(onProject.mock.calls.at(-1)?.[0].theme.showCrumbtrailBranding).toBe(false)
@@ -235,6 +329,7 @@ describe("Crumbtrail experience", () => {
   it("selects one source in recording setup", async () => {
     const user = userEvent.setup(); const project = createMockProject(); project.steps = []
     render(providers(<RecordingSetup project={project} onBack={vi.fn()} onProject={vi.fn()} onStarted={vi.fn()} />))
+    expect(screen.getByText("Keystrokes are discarded; screenshots may still show visible text.")).toBeInTheDocument()
     await user.click(screen.getByRole("button", { name: /window/i }))
     await user.click(screen.getByRole("button", { name: "Choose source" }))
     expect(await screen.findByText("Acme Settings")).toBeInTheDocument()
@@ -289,6 +384,41 @@ describe("Crumbtrail experience", () => {
     await user.click(screen.getByRole("button", { name: "Text" }))
     const annotated = onProject.mock.calls.at(-1)?.[0]
     expect(annotated.steps[0].annotations.some((annotation: { kind: string }) => annotation.kind === "text")).toBe(true)
+  })
+
+  it("treats manual captures as snapshots instead of application interactions", async () => {
+    const user = userEvent.setup()
+    const project = createMockProject()
+    project.steps = [{
+      ...project.steps[0],
+      kind: "manual",
+      application: "Crumbtrail.exe",
+      applicationIconAsset: "mock://application/acme",
+      control: null,
+    }]
+    function Harness() {
+      const [current, setCurrent] = useState(project)
+      return <Editor project={current} onProject={setCurrent} onHome={vi.fn()} onRecord={vi.fn()} />
+    }
+    const { container } = render(providers(<Harness />))
+
+    expect(container.querySelector("[data-manual-snapshot-icon]")).not.toBeNull()
+    expect(screen.getByText("Snapshot")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Auto focus" })).not.toBeInTheDocument()
+    expect(screen.queryByText("Screenshot moment")).not.toBeInTheDocument()
+    expect(screen.queryByText("Crumbtrail.exe")).not.toBeInTheDocument()
+    await user.click(screen.getByRole("switch", { name: "Step icon" }))
+    expect(container.querySelector("[data-manual-snapshot-icon]")).toBeNull()
+  })
+
+  it("lets a recorded step's application name be corrected", () => {
+    const project = createMockProject()
+    const onProject = vi.fn()
+    render(providers(<Editor project={project} onProject={onProject} onHome={vi.fn()} onRecord={vi.fn()} />))
+
+    fireEvent.change(screen.getByLabelText("Application"), { target: { value: "Spotify.exe" } })
+
+    expect(onProject.mock.calls.at(-1)?.[0].steps[0].application).toBe("Spotify.exe")
   })
 
   it("deletes the selected canvas annotation with Delete", async () => {

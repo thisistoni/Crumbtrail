@@ -45,6 +45,8 @@ pub struct ThemeSettings {
     pub logo_asset: Option<String>,
     pub show_timestamps: bool,
     pub show_application_names: bool,
+    #[serde(default = "default_show_icons")]
+    pub show_icons: bool,
     #[serde(default = "default_show_crumbtrail_branding")]
     pub show_crumbtrail_branding: bool,
     #[serde(default = "default_report_locale")]
@@ -60,6 +62,7 @@ impl Default for ThemeSettings {
             logo_asset: None,
             show_timestamps: false,
             show_application_names: true,
+            show_icons: default_show_icons(),
             show_crumbtrail_branding: default_show_crumbtrail_branding(),
             report_locale: default_report_locale(),
         }
@@ -67,6 +70,10 @@ impl Default for ThemeSettings {
 }
 
 fn default_show_crumbtrail_branding() -> bool {
+    true
+}
+
+fn default_show_icons() -> bool {
     true
 }
 
@@ -256,6 +263,8 @@ pub struct Step {
     pub application: Option<String>,
     #[serde(default)]
     pub application_icon_asset: Option<String>,
+    #[serde(default = "default_show_icons")]
+    pub show_icon: bool,
     pub control: Option<ControlMetadata>,
     pub media: StepMedia,
     pub annotations: Vec<Annotation>,
@@ -274,6 +283,7 @@ impl Step {
             included: true,
             application: None,
             application_icon_asset: None,
+            show_icon: default_show_icons(),
             control: None,
             media: StepMedia {
                 before_asset: Some(asset),
@@ -406,6 +416,7 @@ pub struct RecordingStateSnapshot {
     pub project_id: Option<String>,
     pub target: Option<CaptureTargetDescriptor>,
     pub step_count: usize,
+    pub session_step_count: usize,
     pub elapsed_ms: u64,
     pub message: Option<String>,
 }
@@ -417,6 +428,7 @@ impl Default for RecordingStateSnapshot {
             project_id: None,
             target: None,
             step_count: 0,
+            session_step_count: 0,
             elapsed_ms: 0,
             message: None,
         }

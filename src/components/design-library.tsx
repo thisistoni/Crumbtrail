@@ -109,6 +109,7 @@ function DesignDialog({ open, onOpenChange, draft, onDraft, onSave }: { open: bo
         <Field><FieldLabel>Logo</FieldLabel><input ref={logoInput} className="hidden" type="file" accept="image/png,image/jpeg" onChange={event => readLogo(event.target.files?.[0])} /><div className="flex items-center gap-3">{draft.logoDataUrl && <img src={draft.logoDataUrl} alt="" className="size-12 rounded-lg border object-contain" />}<Button variant="outline" onClick={() => logoInput.current?.click()}><ImagePlus data-icon="inline-start" />{draft.logoDataUrl ? (locale === "de" ? "Logo ersetzen" : "Replace logo") : (locale === "de" ? "Logo hinzufügen" : "Add logo")}</Button>{draft.logoDataUrl && <Button variant="ghost" onClick={() => patch({ logoDataUrl: null })}><X data-icon="inline-start" />{locale === "de" ? "Entfernen" : "Remove"}</Button>}</div></Field>
         <div className="grid gap-3 sm:grid-cols-2">
           <Field orientation="horizontal"><Switch checked={draft.theme.showApplicationNames} onCheckedChange={value => patchTheme({ showApplicationNames: value })} /><FieldLabel>{locale === "de" ? "Anwendungsnamen" : "Application names"}</FieldLabel></Field>
+          <Field orientation="horizontal"><Switch id="design-step-icons" checked={draft.theme.showIcons} onCheckedChange={value => patchTheme({ showIcons: value })} /><FieldLabel htmlFor="design-step-icons">{locale === "de" ? "Schrittsymbole" : "Step icons"}</FieldLabel></Field>
           <Field orientation="horizontal"><Switch checked={draft.theme.showTimestamps} onCheckedChange={value => patchTheme({ showTimestamps: value })} /><FieldLabel>{locale === "de" ? "Zeitstempel" : "Timestamps"}</FieldLabel></Field>
           <Field orientation="horizontal"><Switch id="design-crumbtrail-branding" checked={draft.theme.showCrumbtrailBranding} onCheckedChange={value => patchTheme({ showCrumbtrailBranding: value })} /><FieldLabel htmlFor="design-crumbtrail-branding">{locale === "de" ? "„Erstellt mit Crumbtrail“ anzeigen" : "Show “Created with Crumbtrail”"}</FieldLabel></Field>
         </div>
@@ -120,7 +121,7 @@ function DesignDialog({ open, onOpenChange, draft, onDraft, onSave }: { open: bo
 
 function emptyDesign(): DesignTemplate {
   const now = new Date().toISOString()
-  return { id: crypto.randomUUID(), name: "", author: "", description: "", logoDataUrl: null, createdAt: now, updatedAt: now, theme: { preset: "crumbtrailLight", accent: "#E9A23B", typography: "modern", logoAsset: null, showTimestamps: false, showApplicationNames: true, showCrumbtrailBranding: true } }
+  return { id: crypto.randomUUID(), name: "", author: "", description: "", logoDataUrl: null, createdAt: now, updatedAt: now, theme: { preset: "crumbtrailLight", accent: "#E9A23B", typography: "modern", logoAsset: null, showTimestamps: false, showApplicationNames: true, showIcons: true, showCrumbtrailBranding: true } }
 }
 
 function reportThemeName(theme: ReportTheme) { return theme === "crumbtrailDark" ? "Crumbtrail Dark" : "Crumbtrail Light" }

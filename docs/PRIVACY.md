@@ -12,12 +12,12 @@ Crumbtrail is designed for local documentation, not surveillance or diagnostic c
 
 ## Data Crumbtrail does not store
 
-- Entered text, ordinary key codes, or raw keyboard logs.
+- Entered text as structured keystroke data, ordinary key codes, or raw keyboard logs.
 - Mouse movement, wheel activity, middle clicks, or activity outside the target.
 - Audio, video, clipboard contents, environment dumps, accounts, or cloud identifiers.
 - Analytics, advertising IDs, crash telemetry, or background network events.
 
-Low-level keyboard hooks classify only whether an eligible printable interaction occurred in the focused control. The key itself is not sent to the persistence worker. Hotkey combinations are recognized only for capture, pause/resume, and stop.
+Low-level keyboard hooks classify only whether an eligible printable interaction occurred in the focused control. The key itself is not sent to the persistence worker. Hotkey combinations are recognized only for capture, pause/resume, and stop. Screenshots can still contain any text visibly rendered inside the selected capture target.
 
 Application icons are extracted locally from the foreground process and stored as PNG assets. Executable paths and process identifiers are not written to project manifests.
 
@@ -27,9 +27,9 @@ If Windows UI Automation marks the focused control as a password field, its phys
 
 ## Local files and recovery
 
-Active sessions live under `%LOCALAPPDATA%\Crumbtrail\sessions`. A completed edit is written to a temporary file and atomically moved into place. Empty recording drafts are excluded from the project library and removed when the user backs out. Sessions with recorded steps are retained until the user removes them.
+Active sessions live under `%LOCALAPPDATA%\Crumbtrail\sessions`. A completed edit is written to a temporary file and atomically moved into place. Empty recording drafts are excluded from the project library. Removed projects are moved to `%LOCALAPPDATA%\Crumbtrail\trash` so the removal can be undone.
 
-Portable project archives and exports are written only to destinations selected by the user. Opening an archive never extracts over an existing session and rejects absolute, parent-relative, symlinked, oversized, or unsupported entries.
+Portable project archives contain only the current manifest and assets it references; unused screenshots are excluded. Archives and exports are written only to destinations selected by the user. Opening an archive never extracts over an existing session and rejects absolute, parent-relative, symlinked, oversized, or unsupported entries.
 
 ## Network access
 

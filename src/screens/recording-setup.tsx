@@ -165,7 +165,7 @@ export function RecordingSetup({ project, onBack, onProject, onStarted }: SetupP
             <div className="grid gap-3 sm:grid-cols-2">
               <OptionCard icon={MousePointer2} title={t("leftClicks")} checked={options.captureLeftClicks} onChecked={value => patchOption("captureLeftClicks", value)} />
               <OptionCard icon={MousePointer2} title={t("rightClicks")} checked={options.captureRightClicks} onChecked={value => patchOption("captureRightClicks", value)} />
-              <OptionCard icon={Keyboard} title={t("typingGroups")} description={locale === "de" ? "Eingetippter Text wird nie gespeichert." : "Entered text is never stored."} checked={options.captureTypingGroups} onChecked={value => patchOption("captureTypingGroups", value)} />
+              <OptionCard icon={Keyboard} title={t("typingGroups")} description={locale === "de" ? "Tastenanschläge werden verworfen; Screenshots können sichtbaren Text enthalten." : "Keystrokes are discarded; screenshots may still show visible text."} checked={options.captureTypingGroups} onChecked={value => patchOption("captureTypingGroups", value)} />
               <OptionCard icon={EyeOff} title={t("passwordRedaction")} description={locale === "de" ? "Passwortfelder werden vor dem Speichern geschwärzt." : "Password fields are redacted before saving."} checked={options.redactPasswords} onChecked={value => patchOption("redactPasswords", value)} locked />
             </div>
           </div>

@@ -1,5 +1,5 @@
 use crate::models::{ApplicationSummary, ProjectManifest, ProjectSummary, PROJECT_SCHEMA_VERSION};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::{
     fs::{self, File},
     io::{Cursor, Write},
@@ -7,7 +7,6 @@ use std::{
 };
 use thiserror::Error;
 use uuid::Uuid;
-use walkdir::WalkDir;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 const MANIFEST_FILE: &str = "manifest.json";
@@ -39,13 +38,19 @@ pub type StorageResult<T> = Result<T, StorageError>;
 #[derive(Debug, Clone)]
 pub struct StorageService {
     sessions_root: PathBuf,
+    trash_root: PathBuf,
 }
 
 impl StorageService {
     pub fn new(app_local_data: PathBuf) -> StorageResult<Self> {
         let sessions_root = app_local_data.join("sessions");
+        let trash_root = app_local_data.join("trash");
         fs::create_dir_all(&sessions_root)?;
-        Ok(Self { sessions_root })
+        fs::create_dir_all(&trash_root)?;
+        Ok(Self {
+            sessions_root,
+            trash_root,
+        })
     }
 
     pub fn create_project(&self, title: &str) -> StorageResult<ProjectManifest> {
@@ -169,17 +174,16 @@ impl StorageService {
         let mut zip = ZipWriter::new(file);
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
-        for entry in WalkDir::new(&session).follow_links(false) {
-            let entry = entry.map_err(|error| std::io::Error::other(error.to_string()))?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let relative = entry
-                .path()
-                .strip_prefix(&session)
-                .map_err(|_| StorageError::UnsafeAssetPath)?;
-            zip.start_file(path_to_archive_name(relative), options)?;
-            let mut source = File::open(entry.path())?;
+        let mut archive_files = referenced_assets(project)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<HashSet<_>>();
+        archive_files.insert(PathBuf::from(MANIFEST_FILE));
+        let mut archive_files = archive_files.into_iter().collect::<Vec<_>>();
+        archive_files.sort();
+        for relative in archive_files {
+            zip.start_file(path_to_archive_name(&relative), options)?;
+            let mut source = File::open(session.join(&relative))?;
             std::io::copy(&mut source, &mut zip)?;
         }
         zip.finish()?.sync_all()?;
@@ -249,9 +253,63 @@ impl StorageService {
     pub fn delete_session(&self, id: &str) -> StorageResult<()> {
         let path = self.session_dir(id)?;
         if path.exists() {
-            fs::remove_dir_all(path)?;
+            let trashed = self.trash_dir(id)?;
+            if trashed.exists() {
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "A trashed copy of this project already exists",
+                )));
+            }
+            fs::rename(path, trashed)?;
         }
         Ok(())
+    }
+
+    pub fn restore_session(&self, id: &str) -> StorageResult<()> {
+        let trashed = self.trash_dir(id)?;
+        if !trashed.exists() {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "The trashed project no longer exists",
+            )));
+        }
+        let session = self.session_dir(id)?;
+        if session.exists() {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "A project with this identifier already exists",
+            )));
+        }
+        fs::rename(trashed, session)?;
+        Ok(())
+    }
+
+    pub fn compact_session(&self, id: &str) -> StorageResult<usize> {
+        let project = self.load_session(id)?;
+        let session = self.session_dir(id)?;
+        let referenced = referenced_assets(&project)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<HashSet<_>>();
+        let mut removed = 0;
+        for folder in ["media", "thumbnails"] {
+            let folder_path = session.join(folder);
+            let Ok(entries) = fs::read_dir(folder_path) else {
+                continue;
+            };
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let relative = PathBuf::from(folder).join(entry.file_name());
+                if !referenced.contains(&relative) {
+                    fs::remove_file(entry.path())?;
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
     }
 
     fn validate_manifest(&self, project: &ProjectManifest) -> StorageResult<()> {
@@ -290,22 +348,7 @@ impl StorageService {
         project: &ProjectManifest,
         session: &Path,
     ) -> StorageResult<()> {
-        let mut assets = Vec::new();
-        if let Some(logo) = project.theme.logo_asset.as_deref() {
-            assets.push(logo);
-        }
-        for step in &project.steps {
-            if let Some(asset) = step.application_icon_asset.as_deref() {
-                assets.push(asset);
-            }
-            if let Some(asset) = step.media.before_asset.as_deref() {
-                assets.push(asset);
-            }
-            if let Some(asset) = step.media.after_asset.as_deref() {
-                assets.push(asset);
-            }
-        }
-        for asset in assets {
+        for asset in referenced_assets(project) {
             let relative = Path::new(asset);
             if relative.is_absolute()
                 || relative
@@ -326,6 +369,11 @@ impl StorageService {
         Ok(self.sessions_root.join(id))
     }
 
+    fn trash_dir(&self, id: &str) -> StorageResult<PathBuf> {
+        Uuid::parse_str(id).map_err(|_| StorageError::InvalidProjectId)?;
+        Ok(self.trash_root.join(id))
+    }
+
     fn asset_path(&self, project_id: &str, relative: &Path) -> StorageResult<PathBuf> {
         if relative.is_absolute()
             || relative
@@ -336,6 +384,25 @@ impl StorageService {
         }
         Ok(self.session_dir(project_id)?.join(relative))
     }
+}
+
+fn referenced_assets(project: &ProjectManifest) -> Vec<&str> {
+    let mut assets = Vec::new();
+    if let Some(logo) = project.theme.logo_asset.as_deref() {
+        assets.push(logo);
+    }
+    for step in &project.steps {
+        if let Some(asset) = step.application_icon_asset.as_deref() {
+            assets.push(asset);
+        }
+        if let Some(asset) = step.media.before_asset.as_deref() {
+            assets.push(asset);
+        }
+        if let Some(asset) = step.media.after_asset.as_deref() {
+            assets.push(asset);
+        }
+    }
+    assets
 }
 
 fn project_applications(project: &ProjectManifest) -> Vec<ApplicationSummary> {
@@ -472,6 +539,74 @@ mod tests {
         assert_eq!(reopened.title, project.title);
         assert_eq!(reopened.steps.len(), 1);
         assert_ne!(reopened.id, project.id);
+    }
+
+    #[test]
+    fn portable_archive_contains_only_manifest_referenced_assets() {
+        let (temp, storage) = service();
+        let mut project = storage.create_project("Private guide").unwrap();
+        let referenced = storage
+            .write_asset(&project.id, "current.png", b"current")
+            .unwrap();
+        let orphaned = storage
+            .write_asset(&project.id, "deleted.png", b"sensitive old screenshot")
+            .unwrap();
+        project
+            .steps
+            .push(crate::models::Step::manual(referenced.clone()));
+        let destination = temp.path().join("private.crumbtrail");
+
+        storage.save_archive(&project, &destination).unwrap();
+
+        let mut archive = ZipArchive::new(File::open(destination).unwrap()).unwrap();
+        let names = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&MANIFEST_FILE.to_string()));
+        assert!(names.contains(&referenced));
+        assert!(!names.contains(&orphaned));
+    }
+
+    #[test]
+    fn compact_session_keeps_referenced_assets_and_removes_orphans() {
+        let (_temp, storage) = service();
+        let mut project = storage.create_project("Compact guide").unwrap();
+        let referenced = storage
+            .write_asset(&project.id, "current.png", b"current")
+            .unwrap();
+        let orphaned = storage
+            .write_asset(&project.id, "deleted.png", b"deleted")
+            .unwrap();
+        project
+            .steps
+            .push(crate::models::Step::manual(referenced.clone()));
+        storage.autosave(&project).unwrap();
+
+        assert_eq!(storage.compact_session(&project.id).unwrap(), 1);
+        assert!(storage.read_asset(&project.id, &referenced).is_ok());
+        assert!(storage.read_asset(&project.id, &orphaned).is_err());
+    }
+
+    #[test]
+    fn deleted_sessions_can_be_restored_from_trash() {
+        let (_temp, storage) = service();
+        let mut project = storage.create_project("Recover me").unwrap();
+        let asset = storage
+            .write_asset(&project.id, "step.png", b"image")
+            .unwrap();
+        project.steps.push(crate::models::Step::manual(asset));
+        storage.autosave(&project).unwrap();
+
+        storage.delete_session(&project.id).unwrap();
+        assert!(storage.load_session(&project.id).is_err());
+        assert!(storage.trash_dir(&project.id).unwrap().is_dir());
+
+        storage.restore_session(&project.id).unwrap();
+        assert_eq!(
+            storage.load_session(&project.id).unwrap().title,
+            "Recover me"
+        );
+        assert!(!storage.trash_dir(&project.id).unwrap().exists());
     }
 
     #[test]

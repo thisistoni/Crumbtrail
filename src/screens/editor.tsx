@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog"
+import { getCurrentWindow } from "@tauri-apps/api/window"
 import {
   ArrowLeft, ArrowRight, Blend, BoxSelect, ChevronDown, CircleDot, Copy, Crop, Download, Eye, FileArchive,
   FileCode2, FileImage, FileText, ImagePlus, LocateFixed, Merge, Minus, MonitorDot,
@@ -29,6 +30,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { bridge, isTauri } from "@/lib/bridge"
+import { AutosaveQueue } from "@/lib/autosave-queue"
 import { deleteDesignTemplate, designFromProject, loadDesignTemplates, upsertDesignTemplate } from "@/lib/design-templates"
 import { useLocale } from "@/lib/i18n"
 import { useSettings } from "@/lib/settings"
@@ -57,7 +59,7 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
   const [loadedImage, setLoadedImage] = useState({ key: "", url: "" })
   const [previewOpen, setPreviewOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
-  const [saved, setSaved] = useState(true)
+  const [saveStatus, setSaveStatus] = useState<"saved" | "saving" | "error">("saved")
   const [zoom, setZoom] = useState(1)
   const [cropMode, setCropMode] = useState(false)
   const undoStack = useRef<ProjectManifest[]>([])
@@ -70,6 +72,24 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
   const [canvasAspect, setCanvasAspect] = useState(16 / 9)
   const { locale, t } = useLocale()
   const { settings } = useSettings()
+  const mounted = useRef(true)
+  const onProjectRef = useRef(onProject)
+  const localeRef = useRef(locale)
+  const debounceTimer = useRef<number | null>(null)
+  const retryTimer = useRef<number | null>(null)
+  const saveErrorReported = useRef(false)
+  const compactSessionRef = useRef<() => Promise<void>>(() => Promise.resolve())
+  const autosaveQueue = useRef<AutosaveQueue<ProjectManifest> | null>(null)
+  onProjectRef.current = onProject
+  localeRef.current = locale
+  if (!autosaveQueue.current) {
+    autosaveQueue.current = new AutosaveQueue(bridge.autosave, savedProject => {
+      if (!mounted.current) return
+      saveErrorReported.current = false
+      setSaveStatus("saved")
+      onProjectRef.current(savedProject)
+    })
+  }
   const selectedIndex = Math.max(0, project.steps.findIndex(item => item.id === selectedId))
   const step = project.steps[selectedIndex]
   const cropAnnotation = step?.annotations.find(item => item.kind === "crop") ?? null
@@ -93,10 +113,34 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
   }, [project.id, selectedAsset, selectedAssetKey])
 
   useEffect(() => {
-    if (saved) return
-    const timer = window.setTimeout(() => bridge.autosave(project).then(savedProject => { onProject(savedProject); setSaved(true) }).catch(error => toast.error(locale === "de" ? "Automatisches Speichern fehlgeschlagen" : "Autosave failed", { description: String(error) })), 450)
-    return () => clearTimeout(timer)
-  }, [project, saved, locale, onProject])
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      if (debounceTimer.current !== null) window.clearTimeout(debounceTimer.current)
+      if (retryTimer.current !== null) window.clearTimeout(retryTimer.current)
+      void autosaveQueue.current?.flush().catch(() => undefined)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isTauri()) return
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void getCurrentWindow().onCloseRequested(async event => {
+      event.preventDefault()
+      try {
+        await persistAutosave()
+        await compactSessionRef.current()
+        await getCurrentWindow().destroy()
+      } catch {
+        // Keep the window open so the user can retry or copy their work.
+      }
+    }).then(stop => {
+      if (disposed) stop()
+      else unlisten = stop
+    })
+    return () => { disposed = true; unlisten?.() }
+  }, [])
 
   useEffect(() => {
     setSelectedAnnotationId(null)
@@ -119,20 +163,76 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
     if (!manualZoom.current && viewportSize.width && viewportSize.height) setZoom(fittedZoom(viewportSize, canvasAspect))
   }, [canvasAspect, selectedId, viewportSize])
 
+  function queueProject(next: ProjectManifest) {
+    const normalized = { ...next, schemaVersion: 2 as const }
+    autosaveQueue.current?.enqueue(normalized)
+    setSaveStatus("saving")
+    saveErrorReported.current = false
+    if (retryTimer.current !== null) window.clearTimeout(retryTimer.current)
+    if (debounceTimer.current !== null) window.clearTimeout(debounceTimer.current)
+    debounceTimer.current = window.setTimeout(() => {
+      debounceTimer.current = null
+      void persistAutosave().catch(() => undefined)
+    }, 450)
+    onProject(normalized)
+  }
+
+  async function persistAutosave() {
+    if (debounceTimer.current !== null) {
+      window.clearTimeout(debounceTimer.current)
+      debounceTimer.current = null
+    }
+    try {
+      await autosaveQueue.current?.flush()
+    } catch (error) {
+      if (mounted.current) {
+        setSaveStatus("error")
+        if (!saveErrorReported.current) {
+          saveErrorReported.current = true
+          toast.error(localeRef.current === "de" ? "Automatisches Speichern fehlgeschlagen" : "Autosave failed", { description: String(error) })
+        }
+        if (retryTimer.current !== null) window.clearTimeout(retryTimer.current)
+        retryTimer.current = window.setTimeout(() => {
+          retryTimer.current = null
+          void persistAutosave().catch(() => undefined)
+        }, 2000)
+      }
+      throw error
+    }
+  }
+
+  async function leaveEditor(action: () => void) {
+    try {
+      await persistAutosave()
+      await compactSession()
+      action()
+    } catch {
+      // The failure is already visible and navigation must not discard the edit.
+    }
+  }
+
+  async function compactSession() {
+    try {
+      await bridge.compactSession(project.id)
+    } catch (error) {
+      toast.warning(localeRef.current === "de" ? "Nicht verwendete Bilder konnten nicht bereinigt werden" : "Could not clean up unused images", { description: String(error) })
+    }
+  }
+  compactSessionRef.current = compactSession
+
   function commit(next: ProjectManifest) {
     undoStack.current.push(project)
     if (undoStack.current.length > 50) undoStack.current.shift()
     redoStack.current = []
-    setSaved(false)
-    onProject({ ...next, schemaVersion: 2 })
+    queueProject(next)
   }
   const updateProject = (patch: Partial<ProjectManifest>) => commit({ ...project, ...patch })
   const updateStep = (patch: Partial<Step>) => {
     if (!step) return
     commit({ ...project, steps: project.steps.map(item => item.id === step.id ? { ...item, ...patch } : item) })
   }
-  function undo() { const previous = undoStack.current.pop(); if (!previous) return; redoStack.current.push(project); setSaved(false); onProject(previous) }
-  function redo() { const next = redoStack.current.pop(); if (!next) return; undoStack.current.push(project); setSaved(false); onProject(next) }
+  function undo() { const previous = undoStack.current.pop(); if (!previous) return; redoStack.current.push(project); queueProject(previous) }
+  function redo() { const next = redoStack.current.pop(); if (!next) return; undoStack.current.push(project); queueProject(next) }
 
   function duplicateStep(id = step?.id) {
     const sourceIndex = project.steps.findIndex(item => item.id === id)
@@ -218,6 +318,9 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
     updateStep({ focusZoom: step.focusZoom ? null : focusRect(step, project.capture.defaultFocusZoomPercent) })
   }
 
+  const queueProjectRef = useRef(queueProject)
+  queueProjectRef.current = queueProject
+
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       const target = event.target
@@ -228,9 +331,8 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
         const next = { ...project, steps: project.steps.map(item => item.id === step.id ? { ...item, annotations: item.annotations.filter(annotation => annotation.id !== selectedAnnotation.id) } : item) }
         undoStack.current.push(project)
         redoStack.current = []
-        setSaved(false)
         setSelectedAnnotationId(null)
-        onProject(next)
+        queueProjectRef.current(next)
         return
       }
       if (selectedAnnotation && step && !selectedAnnotation.protected && !editing && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
@@ -239,8 +341,7 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
         const dx = event.key === "ArrowLeft" ? -amount : event.key === "ArrowRight" ? amount : 0
         const dy = event.key === "ArrowUp" ? -amount : event.key === "ArrowDown" ? amount : 0
         const rect = { ...selectedAnnotation.rect, x: Math.max(0, Math.min(1 - selectedAnnotation.rect.width, selectedAnnotation.rect.x + dx)), y: Math.max(0, Math.min(1 - selectedAnnotation.rect.height, selectedAnnotation.rect.y + dy)) }
-        setSaved(false)
-        onProject({ ...project, steps: project.steps.map(item => item.id === step.id ? { ...item, annotations: item.annotations.map(annotation => annotation.id === selectedAnnotation.id ? { ...annotation, rect } : annotation) } : item) })
+        queueProjectRef.current({ ...project, steps: project.steps.map(item => item.id === step.id ? { ...item, annotations: item.annotations.map(annotation => annotation.id === selectedAnnotation.id ? { ...annotation, rect } : annotation) } : item) })
         return
       }
       if (!canvasHot || !event.ctrlKey || editing) return
@@ -296,6 +397,15 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
       updateStep({ media: { ...step.media, beforeAsset: step.media.selected === "before" ? asset : step.media.beforeAsset, afterAsset: step.media.selected === "after" ? asset : step.media.afterAsset } })
     } catch (error) { toast.error(locale === "de" ? "Bild konnte nicht ersetzt werden" : "Image could not be replaced", { description: String(error) }) }
   }
+  async function replaceStepIcon() {
+    if (!step || !isTauri()) return toast.info(locale === "de" ? "Eigene Symbole sind in der Desktop-App verfügbar" : "Custom icons are available in the desktop build")
+    const source = await openDialog({ multiple: false, filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg"] }] })
+    if (!source) return
+    try {
+      const asset = await bridge.replaceImage(project.id, source)
+      updateStep({ applicationIconAsset: asset, showIcon: true, ...(step.kind === "manual" ? { application: null } : {}) })
+    } catch (error) { toast.error(locale === "de" ? "Symbol konnte nicht ersetzt werden" : "Could not replace the icon", { description: String(error) }) }
+  }
   async function savePortable() {
     if (!isTauri()) return toast.info(locale === "de" ? "Portable Projekte sind in der Desktop-App verfügbar" : "Portable project files are available in the desktop build")
     const destination = await saveDialog({ defaultPath: `${safeName(project.title)}.crumbtrail`, filters: [{ name: "Crumbtrail", extensions: ["crumbtrail"] }] })
@@ -307,11 +417,11 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
   return (
     <main className="flex h-screen min-h-[680px] flex-col overflow-hidden bg-background">
       <header className="flex h-16 shrink-0 items-center gap-3 border-b bg-card px-4">
-        <Button variant="ghost" onClick={onHome}><ArrowLeft data-icon="inline-start" />{t("back")}</Button>
+        <Button variant="ghost" onClick={() => void leaveEditor(onHome)}><ArrowLeft data-icon="inline-start" />{t("back")}</Button>
         <Brand compact />
         <Separator orientation="vertical" className="mx-1" />
         <Input value={project.title} onChange={event => updateProject({ title: event.target.value })} className="h-8 max-w-[420px] flex-1 border-transparent bg-transparent px-1 text-sm font-semibold shadow-none hover:border-border focus:border-border" aria-label="Project title" />
-        <Badge variant="secondary" className="font-normal">{saved ? (locale === "de" ? "Gespeichert" : "Saved") : (locale === "de" ? "Speichert…" : "Saving…")}</Badge>
+        <Badge variant="secondary" className="font-normal">{saveStatus === "saved" ? (locale === "de" ? "Gespeichert" : "Saved") : saveStatus === "error" ? (locale === "de" ? "Speichern fehlgeschlagen" : "Save failed") : (locale === "de" ? "Speichert…" : "Saving…")}</Badge>
         <div className="flex items-center gap-1">
           <ToolButton label={t("undo")} onClick={undo} disabled={!undoStack.current.length}><Undo2 /></ToolButton>
           <ToolButton label={locale === "de" ? "Wiederholen" : "Redo"} onClick={redo} disabled={!redoStack.current.length}><Redo2 /></ToolButton>
@@ -327,12 +437,12 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
 
       <div className="grid min-h-0 flex-1 grid-cols-[300px_minmax(420px,1fr)_340px]">
         <aside className="flex min-h-0 flex-col border-r bg-sidebar">
-          <div className="flex h-14 items-center justify-between px-4"><p className="text-sm font-semibold">{t("steps")} <span className="ml-1 font-normal tabular-nums text-muted-foreground">{project.steps.filter(item => item.included).length}/{project.steps.length}</span></p><Button variant="ghost" size="icon-sm" onClick={onRecord} aria-label={t("record")}><Plus /></Button></div>
+          <div className="flex h-14 items-center justify-between px-4"><p className="text-sm font-semibold">{t("steps")} <span className="ml-1 font-normal tabular-nums text-muted-foreground">{project.steps.filter(item => item.included).length}/{project.steps.length}</span></p><Button variant="ghost" size="icon-sm" onClick={() => void leaveEditor(onRecord)} aria-label={t("record")}><Plus /></Button></div>
           <Separator />
           <ScrollArea className="min-h-0 flex-1">
-            {project.steps.length ? <StepTimeline projectId={project.id} steps={project.steps} selectedId={step?.id ?? null} onSelect={setSelectedId} onReorder={steps => commit({ ...project, steps })} onDuplicate={duplicateStep} onMergeNext={mergeNext} onDelete={deleteStep} /> : <Empty className="border-0 py-16"><EmptyHeader><EmptyMedia variant="icon"><MonitorDot /></EmptyMedia><EmptyTitle>{locale === "de" ? "Noch keine Schritte" : "No steps yet"}</EmptyTitle></EmptyHeader></Empty>}
+            {project.steps.length ? <StepTimeline projectId={project.id} showIcons={project.theme.showIcons} steps={project.steps} selectedId={step?.id ?? null} onSelect={setSelectedId} onReorder={steps => commit({ ...project, steps })} onDuplicate={duplicateStep} onMergeNext={mergeNext} onDelete={deleteStep} /> : <Empty className="border-0 py-16"><EmptyHeader><EmptyMedia variant="icon"><MonitorDot /></EmptyMedia><EmptyTitle>{locale === "de" ? "Noch keine Schritte" : "No steps yet"}</EmptyTitle></EmptyHeader></Empty>}
           </ScrollArea>
-          <div className="border-t p-3"><Button variant="outline" className="w-full" onClick={onRecord}><span className="size-2 rounded-full bg-red-500" />{t("record")}</Button></div>
+          <div className="border-t p-3"><Button variant="outline" className="w-full" onClick={() => void leaveEditor(onRecord)}><span className="size-2 rounded-full bg-red-500" />{t("record")}</Button></div>
         </aside>
 
         <section className="canvas-grid flex min-h-0 min-w-0 flex-col">
@@ -342,8 +452,7 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
               {cropMode && <><Separator orientation="vertical" className="mx-1 h-6" /><Button size="sm" onClick={() => { setCropMode(false); setSelectedAnnotationId(null) }}>{t("confirmCrop")}</Button><Button size="sm" variant="ghost" onClick={resetCrop}><RotateCcw data-icon="inline-start" />{t("resetCrop")}</Button></>}
             </div>
             <div className="flex items-center gap-1">
-              <Button variant={step?.focusZoom && !cropAnnotation ? "secondary" : "ghost"} size="sm" onClick={toggleFocusZoom} disabled={!step || Boolean(cropAnnotation)}><LocateFixed data-icon="inline-start" />{t("autoZoom")}</Button>
-              <Separator orientation="vertical" className="mx-1 h-6" />
+              {step?.kind !== "manual" && <><Button variant={step?.focusZoom && !cropAnnotation ? "secondary" : "ghost"} size="sm" onClick={toggleFocusZoom} disabled={!step || Boolean(cropAnnotation)}><LocateFixed data-icon="inline-start" />{t("autoZoom")}</Button><Separator orientation="vertical" className="mx-1 h-6" /></>}
               <ToolButton label={locale === "de" ? "Verkleinern" : "Zoom out"} onClick={() => changeZoom(value => Math.max(.25, value - .1))}><Minus /></ToolButton>
               <button className="w-14 text-center text-xs tabular-nums text-muted-foreground" onClick={() => changeZoom(() => 1)}>{Math.round(zoom * 100)}%</button>
               <ToolButton label={locale === "de" ? "Vergrößern" : "Zoom in"} onClick={() => changeZoom(value => Math.min(4, value + .1))}><ZoomIn /></ToolButton>
@@ -357,12 +466,12 @@ export function Editor({ project, onProject, onHome, onRecord }: EditorProps) {
             </div>
             {(Math.abs(panOffset.x) > 2 || Math.abs(panOffset.y) > 2) && <Button variant="secondary" size="sm" className="absolute bottom-4 left-1/2 -translate-x-1/2 shadow-lg" onClick={centerCanvas}><LocateFixed data-icon="inline-start" />{locale === "de" ? "Zentrieren" : "Center"}</Button>}
           </div>
-          {step && <div className="flex h-12 shrink-0 items-center justify-between border-t bg-card/90 px-4 text-xs text-muted-foreground"><span>{step.media.selected === "before" ? (locale === "de" ? "Vor der Aktion" : "Before interaction") : (locale === "de" ? "Nach der Aktion" : "After interaction")}</span><Button variant="ghost" size="sm" onClick={replaceImage}><ImagePlus data-icon="inline-start" />{locale === "de" ? "Screenshot ersetzen" : "Replace screenshot"}</Button></div>}
+          {step && <div className="flex h-12 shrink-0 items-center justify-between border-t bg-card/90 px-4 text-xs text-muted-foreground"><span>{step.kind === "manual" ? (locale === "de" ? "Momentaufnahme" : "Snapshot") : step.media.selected === "before" ? (locale === "de" ? "Vor der Aktion" : "Before interaction") : (locale === "de" ? "Nach der Aktion" : "After interaction")}</span><Button variant="ghost" size="sm" onClick={replaceImage}><ImagePlus data-icon="inline-start" />{locale === "de" ? "Screenshot ersetzen" : "Replace screenshot"}</Button></div>}
         </section>
 
         <aside className="min-h-0 border-l bg-card">
           <ScrollArea className="h-full">
-            {step ? <Inspector step={step} stepNumber={selectedIndex + 1} selectedAnnotation={selectedAnnotation} onSelectAnnotation={setSelectedAnnotationId} updateStep={updateStep} updateAnnotation={updateAnnotation} deleteAnnotation={deleteAnnotation} duplicateStep={duplicateStep} mergeNext={mergeNext} deleteStep={deleteStep} canMerge={Boolean(project.steps[selectedIndex + 1])} /> : <Empty className="h-full"><EmptyHeader><EmptyMedia variant="icon"><PanelRight /></EmptyMedia><EmptyTitle>{locale === "de" ? "Nichts ausgewählt" : "Nothing selected"}</EmptyTitle></EmptyHeader></Empty>}
+            {step ? <Inspector step={step} stepNumber={selectedIndex + 1} selectedAnnotation={selectedAnnotation} onSelectAnnotation={setSelectedAnnotationId} updateStep={updateStep} updateAnnotation={updateAnnotation} deleteAnnotation={deleteAnnotation} replaceStepIcon={replaceStepIcon} duplicateStep={duplicateStep} mergeNext={mergeNext} deleteStep={deleteStep} canMerge={Boolean(project.steps[selectedIndex + 1])} /> : <Empty className="h-full"><EmptyHeader><EmptyMedia variant="icon"><PanelRight /></EmptyMedia><EmptyTitle>{locale === "de" ? "Nichts ausgewählt" : "Nothing selected"}</EmptyTitle></EmptyHeader></Empty>}
           </ScrollArea>
         </aside>
       </div>
@@ -377,7 +486,7 @@ function ToolButton({ label, onClick, disabled, active, children }: { label: str
   return <Tooltip><TooltipTrigger render={<Button variant={active ? "secondary" : "ghost"} size="icon" onClick={onClick} disabled={disabled} aria-label={label} />}>{children}</TooltipTrigger><TooltipContent>{label}</TooltipContent></Tooltip>
 }
 
-function Inspector({ step, stepNumber, selectedAnnotation, onSelectAnnotation, updateStep, updateAnnotation, deleteAnnotation, duplicateStep, mergeNext, deleteStep, canMerge }: { step: Step; stepNumber: number; selectedAnnotation: Annotation | null; onSelectAnnotation(id: string): void; updateStep(patch: Partial<Step>): void; updateAnnotation(id: string, patch: Partial<Annotation>): void; deleteAnnotation(id: string): void; duplicateStep(): void; mergeNext(): void; deleteStep(): void; canMerge: boolean }) {
+function Inspector({ step, stepNumber, selectedAnnotation, onSelectAnnotation, updateStep, updateAnnotation, deleteAnnotation, replaceStepIcon, duplicateStep, mergeNext, deleteStep, canMerge }: { step: Step; stepNumber: number; selectedAnnotation: Annotation | null; onSelectAnnotation(id: string): void; updateStep(patch: Partial<Step>): void; updateAnnotation(id: string, patch: Partial<Annotation>): void; deleteAnnotation(id: string): void; replaceStepIcon(): void; duplicateStep(): void; mergeNext(): void; deleteStep(): void; canMerge: boolean }) {
   const { locale, t } = useLocale()
   const markings = step.annotations.filter(annotation => annotation.kind !== "crop")
   return <div className="p-5">
@@ -385,16 +494,17 @@ function Inspector({ step, stepNumber, selectedAnnotation, onSelectAnnotation, u
     <FieldGroup className="mt-5">
       <Field><FieldLabel htmlFor="instruction">{t("instruction")}</FieldLabel><Textarea id="instruction" rows={3} value={step.instruction} onChange={event => updateStep({ instruction: event.target.value })} /></Field>
       <Field><FieldLabel htmlFor="notes">{t("notes")}</FieldLabel><Textarea id="notes" rows={4} value={step.notes} onChange={event => updateStep({ notes: event.target.value })} /></Field>
+      {step.kind !== "manual" && <Field><FieldLabel htmlFor={`application-${step.id}`}>{locale === "de" ? "Anwendung" : "Application"}</FieldLabel><Input id={`application-${step.id}`} value={step.application ?? ""} onChange={event => updateStep({ application: event.target.value || null })} /></Field>}
       <Field orientation="horizontal"><Checkbox id="included" checked={step.included} onCheckedChange={value => updateStep({ included: value === true })} /><FieldLabel htmlFor="included">{locale === "de" ? "Im Bericht anzeigen" : "Include in report"}</FieldLabel></Field>
     </FieldGroup>
     <Separator className="my-6" />
-    <p className="text-sm font-semibold">{locale === "de" ? "Screenshot-Zeitpunkt" : "Screenshot moment"}</p>
-    <Tabs value={step.media.selected} onValueChange={value => updateStep({ media: { ...step.media, selected: value as "before" | "after" } })} className="mt-3"><TabsList className="w-full"><TabsTrigger value="before" className="flex-1" disabled={!step.media.beforeAsset}>{locale === "de" ? "Vorher" : "Before"}</TabsTrigger><TabsTrigger value="after" className="flex-1" disabled={!step.media.afterAsset}>{locale === "de" ? "Nachher" : "After"}</TabsTrigger></TabsList></Tabs>
+    <div className="flex items-center justify-between gap-3"><Field orientation="horizontal"><Switch id={`step-icon-${step.id}`} checked={step.showIcon !== false} onCheckedChange={value => updateStep({ showIcon: value })} /><FieldLabel htmlFor={`step-icon-${step.id}`}>{locale === "de" ? "Schrittsymbol" : "Step icon"}</FieldLabel></Field><Button variant="outline" size="sm" onClick={replaceStepIcon}><ImagePlus data-icon="inline-start" />{locale === "de" ? "Ersetzen" : "Replace"}</Button></div>
+    {step.kind !== "manual" && <><Separator className="my-6" /><p className="text-sm font-semibold">{locale === "de" ? "Screenshot-Zeitpunkt" : "Screenshot moment"}</p><Tabs value={step.media.selected} onValueChange={value => updateStep({ media: { ...step.media, selected: value as "before" | "after" } })} className="mt-3"><TabsList className="w-full"><TabsTrigger value="before" className="flex-1" disabled={!step.media.beforeAsset}>{locale === "de" ? "Vorher" : "Before"}</TabsTrigger><TabsTrigger value="after" className="flex-1" disabled={!step.media.afterAsset}>{locale === "de" ? "Nachher" : "After"}</TabsTrigger></TabsList></Tabs></>}
     <Separator className="my-6" />
     <div className="flex items-center justify-between"><p className="text-sm font-semibold">{t("annotations")}</p><span className="text-xs tabular-nums text-muted-foreground">{markings.length}</span></div>
     <div data-annotation-list className="mt-3 grid gap-2">{markings.map(annotation => <AnnotationRow key={annotation.id} annotation={annotation} selected={annotation.id === selectedAnnotation?.id} onSelect={() => onSelectAnnotation(annotation.id)} remove={() => deleteAnnotation(annotation.id)} />)}</div>
     {selectedAnnotation && <AnnotationProperties annotation={selectedAnnotation} update={patch => updateAnnotation(selectedAnnotation.id, patch)} remove={() => deleteAnnotation(selectedAnnotation.id)} />}
-    {step.application && <div className="mt-6 rounded-xl bg-muted/65 p-3 text-xs"><p className="font-medium">{step.application}</p>{step.control && <p className="mt-1 text-muted-foreground">{step.control.controlType}{step.control.name ? ` · ${step.control.name}` : ""}</p>}</div>}
+    {step.kind !== "manual" && step.control && <div className="mt-6 rounded-xl bg-muted/65 p-3 text-xs text-muted-foreground">{step.control.controlType}{step.control.name ? ` · ${step.control.name}` : ""}</div>}
   </div>
 }
 
@@ -467,6 +577,7 @@ function BrandingPanel({ project, update }: { project: ProjectManifest; update(p
       <Field><FieldLabel>{t("color")}</FieldLabel><div className="flex gap-2"><input type="color" value={project.theme.accent} onChange={event => patchTheme({ accent: event.target.value })} className="size-9 rounded-lg border bg-transparent p-1" /><Input value={project.theme.accent} onChange={event => /^#[0-9a-f]{0,6}$/i.test(event.target.value) && patchTheme({ accent: event.target.value })} /></div></Field>
       <Field><FieldLabel>Logo</FieldLabel><div className="flex gap-2"><Button variant="outline" className="flex-1" onClick={chooseLogo}><ImagePlus data-icon="inline-start" />{project.theme.logoAsset ? (locale === "de" ? "Logo ersetzen" : "Replace logo") : (locale === "de" ? "Logo hinzufügen" : "Add logo")}</Button>{project.theme.logoAsset && <Button variant="ghost" onClick={() => patchTheme({ logoAsset: null })}>{t("remove")}</Button>}</div></Field>
       <Field orientation="horizontal"><Switch checked={project.theme.showApplicationNames} onCheckedChange={value => patchTheme({ showApplicationNames: value })} /><FieldLabel>{locale === "de" ? "Anwendungsnamen" : "Application names"}</FieldLabel></Field>
+      <Field orientation="horizontal"><Switch id="project-step-icons" checked={project.theme.showIcons} onCheckedChange={value => patchTheme({ showIcons: value })} /><FieldLabel htmlFor="project-step-icons">{locale === "de" ? "Schrittsymbole" : "Step icons"}</FieldLabel></Field>
       <Field orientation="horizontal"><Switch checked={project.theme.showTimestamps} onCheckedChange={value => patchTheme({ showTimestamps: value })} /><FieldLabel>{locale === "de" ? "Zeitstempel" : "Timestamps"}</FieldLabel></Field>
       <Field orientation="horizontal"><Switch id="project-crumbtrail-branding" checked={project.theme.showCrumbtrailBranding} onCheckedChange={value => patchTheme({ showCrumbtrailBranding: value })} /><FieldLabel htmlFor="project-crumbtrail-branding">{locale === "de" ? "„Erstellt mit Crumbtrail“ anzeigen" : "Show “Created with Crumbtrail”"}</FieldLabel></Field>
       <Separator />

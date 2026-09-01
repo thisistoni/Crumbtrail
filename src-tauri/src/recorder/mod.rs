@@ -49,8 +49,8 @@ pub trait CaptureBackend: Send {
     ) -> RecorderResult<RecordingStateSnapshot>;
     fn pause(&mut self) -> RecorderResult<RecordingStateSnapshot>;
     fn resume(&mut self) -> RecorderResult<RecordingStateSnapshot>;
-    fn manual_capture(&mut self) -> RecorderResult<()>;
-    fn undo_last(&mut self, storage: &StorageService) -> RecorderResult<()>;
+    fn manual_capture(&mut self) -> RecorderResult<RecordingStateSnapshot>;
+    fn undo_last(&mut self) -> RecorderResult<()>;
     fn stop(&mut self) -> RecorderResult<RecordingStateSnapshot>;
     fn state(&self) -> RecordingStateSnapshot;
 }
@@ -117,11 +117,11 @@ impl RecorderManager {
     pub fn resume(&self) -> RecorderResult<RecordingStateSnapshot> {
         self.backend.lock().resume()
     }
-    pub fn manual_capture(&self) -> RecorderResult<()> {
+    pub fn manual_capture(&self) -> RecorderResult<RecordingStateSnapshot> {
         self.backend.lock().manual_capture()
     }
-    pub fn undo_last(&self, storage: &StorageService) -> RecorderResult<()> {
-        self.backend.lock().undo_last(storage)
+    pub fn undo_last(&self) -> RecorderResult<()> {
+        self.backend.lock().undo_last()
     }
     pub fn stop(&self) -> RecorderResult<RecordingStateSnapshot> {
         self.backend.lock().stop()
@@ -169,10 +169,10 @@ impl CaptureBackend for UnsupportedBackend {
     fn resume(&mut self) -> RecorderResult<RecordingStateSnapshot> {
         Err(RecorderError::Unsupported)
     }
-    fn manual_capture(&mut self) -> RecorderResult<()> {
+    fn manual_capture(&mut self) -> RecorderResult<RecordingStateSnapshot> {
         Err(RecorderError::Unsupported)
     }
-    fn undo_last(&mut self, _: &StorageService) -> RecorderResult<()> {
+    fn undo_last(&mut self) -> RecorderResult<()> {
         Err(RecorderError::Unsupported)
     }
     fn stop(&mut self) -> RecorderResult<RecordingStateSnapshot> {

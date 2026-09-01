@@ -13,7 +13,7 @@ interface VisiblePulse extends ClickPulse {
 }
 
 export function RecordingOverlay() {
-  const snapshot = useRef<RecordingStateSnapshot>({ status: "recording", stepCount: 0, elapsedMs: 0 })
+  const snapshot = useRef<RecordingStateSnapshot>({ status: "recording", stepCount: 0, sessionStepCount: 0, elapsedMs: 0 })
   const pulseId = useRef(0)
   const [paused, setPaused] = useState(false)
   const [pulses, setPulses] = useState<VisiblePulse[]>([])

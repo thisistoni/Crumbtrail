@@ -51,12 +51,13 @@ export function createMockProject(title = "Workspace appearance guide"): Project
   return {
     schemaVersion: 2, id: crypto.randomUUID(), title, description: "A short, polished walkthrough recorded with Crumbtrail.", author: "",
     createdAt: now, updatedAt: now, capture: { ...defaultRecordingOptions }, steps: makeSampleSteps(),
-    theme: { preset: "crumbtrailLight", accent: "#E9A23B", typography: "modern", logoAsset: null, showTimestamps: false, showApplicationNames: true, showCrumbtrailBranding: true, reportLocale: "en" },
+    theme: { preset: "crumbtrailLight", accent: "#E9A23B", typography: "modern", logoAsset: null, showTimestamps: false, showApplicationNames: true, showIcons: true, showCrumbtrailBranding: true, reportLocale: "en" },
   }
 }
 
 let browserSessions: ProjectManifest[] = [createMockProject()]
-let browserRecording: RecordingStateSnapshot = { status: "idle", stepCount: 0, elapsedMs: 0 }
+let browserRecording: RecordingStateSnapshot = { status: "idle", stepCount: 0, sessionStepCount: 0, elapsedMs: 0 }
+let browserTrash: ProjectManifest[] = []
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> { return invoke<T>(command, args) }
 
@@ -101,7 +102,19 @@ export const bridge = {
   },
   async deleteSession(id: string) {
     if (isTauri()) return call<void>("delete_session", { id })
+    const removed = browserSessions.find(item => item.id === id)
+    if (removed) browserTrash = [removed, ...browserTrash.filter(item => item.id !== id)]
     browserSessions = browserSessions.filter(item => item.id !== id)
+  },
+  async restoreSession(id: string) {
+    if (isTauri()) return call<void>("restore_session", { id })
+    const restored = browserTrash.find(item => item.id === id)
+    if (restored) browserSessions = [restored, ...browserSessions.filter(item => item.id !== id)]
+    browserTrash = browserTrash.filter(item => item.id !== id)
+  },
+  async compactSession(id: string) {
+    if (isTauri()) return call<number>("compact_session", { id })
+    return 0
   },
   openProject: (source: string) => call<ProjectManifest>("open_project", { source }),
   saveProject: (project: ProjectManifest, destination: string) => call<string>("save_project", { project, destination }),
@@ -141,11 +154,15 @@ export const bridge = {
   },
   async startRecording(projectId: string, options: RecordingOptions, region?: PixelRect | null) {
     if (isTauri()) return call<RecordingStateSnapshot>("start_recording", { projectId, options, region })
-    browserRecording = { status: "recording", projectId, target: { id: "preview", kind: options.targetKind, label: "Preview target", bounds: region ?? { x: 0, y: 0, width: 1280, height: 720 }, scaleFactor: 1 }, stepCount: 0, elapsedMs: 0 }; return browserRecording
+    browserRecording = { status: "recording", projectId, target: { id: "preview", kind: options.targetKind, label: "Preview target", bounds: region ?? { x: 0, y: 0, width: 1280, height: 720 }, scaleFactor: 1 }, stepCount: 0, sessionStepCount: 0, elapsedMs: 0 }; return browserRecording
   },
   async pause() { if (isTauri()) return call<RecordingStateSnapshot>("pause_recording"); return browserRecording = { ...browserRecording, status: "paused" } },
   async resume() { if (isTauri()) return call<RecordingStateSnapshot>("resume_recording"); return browserRecording = { ...browserRecording, status: "recording" } },
-  manual: () => isTauri() ? call<void>("capture_manual_step") : Promise.resolve(),
+  manual: async () => {
+    if (isTauri()) return call<RecordingStateSnapshot>("capture_manual_step")
+    browserRecording = { ...browserRecording, stepCount: browserRecording.stepCount + 1, sessionStepCount: browserRecording.sessionStepCount + 1 }
+    return browserRecording
+  },
   undoRecorded: () => isTauri() ? call<void>("undo_recorded_step") : Promise.resolve(),
   async stop() { if (isTauri()) return call<RecordingStateSnapshot>("stop_recording"); return browserRecording = { ...browserRecording, status: "idle" } },
   async recordingState() { if (isTauri()) return call<RecordingStateSnapshot>("recording_state"); return browserRecording },

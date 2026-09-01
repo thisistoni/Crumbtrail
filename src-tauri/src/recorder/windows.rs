@@ -8,7 +8,10 @@ use crate::{
     },
     storage::StorageService,
 };
-use image::{DynamicImage, ImageFormat, RgbaImage};
+use image::{
+    codecs::png::{CompressionType, FilterType, PngEncoder},
+    DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat, RgbaImage,
+};
 use parking_lot::Mutex;
 use std::{
     collections::HashMap,
@@ -27,7 +30,7 @@ use uuid::Uuid;
 use windows::{
     Graphics::Capture::GraphicsCaptureItem,
     Win32::{
-        Foundation::{LPARAM, LRESULT, POINT, WPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
         Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -36,7 +39,7 @@ use windows::{
                 GetAsyncKeyState, VK_CONTROL, VK_LBUTTON, VK_MENU, VK_RBUTTON, VK_SHIFT,
             },
             WindowsAndMessaging::{
-                CallNextHookEx, DispatchMessageW, GetAncestor, GetCursorPos,
+                CallNextHookEx, DispatchMessageW, GetAncestor, GetCursorPos, GetForegroundWindow,
                 GetWindowThreadProcessId, PeekMessageW, SetWindowsHookExW, TranslateMessage,
                 UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, HC_ACTION, KBDLLHOOKSTRUCT, MSG,
                 MSLLHOOKSTRUCT, PM_REMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN,
@@ -61,9 +64,9 @@ use windows_icons::{get_icon_by_process_id_with_size, IconSize};
 
 type ActiveCapture = CaptureControl<FrameHandler, String>;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct FrameSnapshot {
-    rgba: Vec<u8>,
+    rgba: Arc<Vec<u8>>,
     width: u32,
     height: u32,
     sequence: u64,
@@ -113,7 +116,7 @@ impl GraphicsCaptureApiHandler for FrameHandler {
         bgra_to_rgba(&mut rgba);
         let sequence = self.shared.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         *self.shared.latest.lock() = Some(FrameSnapshot {
-            rgba,
+            rgba: Arc::new(rgba),
             width,
             height,
             sequence,
@@ -231,7 +234,7 @@ pub(crate) fn capture_monitor_thumbnail(target_id: &str) -> RecorderResult<Vec<u
         .stop()
         .map_err(|error| RecorderError::Platform(error.to_string()))?;
 
-    let image = RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+    let image = RgbaImage::from_raw(frame.width, frame.height, frame.rgba.as_ref().clone())
         .ok_or_else(|| RecorderError::Platform("Invalid display preview frame.".to_string()))?;
     let thumbnail = DynamicImage::ImageRgba8(image).thumbnail(640, 360);
     let mut output = Cursor::new(Vec::new());
@@ -241,27 +244,68 @@ pub(crate) fn capture_monitor_thumbnail(target_id: &str) -> RecorderResult<Vec<u
     Ok(output.into_inner())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum InputEvent {
     Click {
         x: i32,
         y: i32,
         right: bool,
         at: Instant,
+        application: ApplicationIdentity,
+        before: Option<FrameSnapshot>,
     },
-    Typing,
-    Manual,
+    Typing {
+        application: ApplicationIdentity,
+        before: Option<FrameSnapshot>,
+    },
+    Manual {
+        response: Option<mpsc::SyncSender<Result<(), String>>>,
+        frame: Option<FrameSnapshot>,
+    },
+    Undo {
+        response: mpsc::SyncSender<Result<(), String>>,
+    },
     TogglePause,
     Stop,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ApplicationIdentity {
+    window: isize,
+    process_id: u32,
+}
+
 static INPUT_SENDER: OnceLock<std::sync::Mutex<Option<Sender<InputEvent>>>> = OnceLock::new();
+static INPUT_CAPTURE_SHARED: OnceLock<std::sync::Mutex<Option<Arc<CaptureShared>>>> =
+    OnceLock::new();
 static MANUAL_SHORTCUT_KEY: AtomicU32 = AtomicU32::new(0x77);
 static PAUSE_SHORTCUT_KEY: AtomicU32 = AtomicU32::new(0x78);
 static STOP_SHORTCUT_KEY: AtomicU32 = AtomicU32::new(0x79);
+static MANUAL_CAPTURE_PENDING: AtomicBool = AtomicBool::new(false);
+
+fn begin_manual_capture() -> bool {
+    MANUAL_CAPTURE_PENDING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+fn finish_manual_capture() {
+    MANUAL_CAPTURE_PENDING.store(false, Ordering::Release);
+}
 
 fn input_sender() -> &'static std::sync::Mutex<Option<Sender<InputEvent>>> {
     INPUT_SENDER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn input_capture_shared() -> &'static std::sync::Mutex<Option<Arc<CaptureShared>>> {
+    INPUT_CAPTURE_SHARED.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn input_frame_snapshot() -> Option<FrameSnapshot> {
+    input_capture_shared()
+        .try_lock()
+        .ok()
+        .and_then(|shared| shared.as_ref().and_then(|shared| latest_frame(shared)))
 }
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -277,6 +321,8 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     y: event.pt.y,
                     right: wparam.0 as u32 == WM_RBUTTONDOWN,
                     at: Instant::now(),
+                    application: application_at_point(event.pt.x, event.pt.y),
+                    before: input_frame_snapshot(),
                 });
             }
         }
@@ -295,22 +341,33 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         let alt = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0;
         let classified =
             if ctrl && shift && event.vkCode == MANUAL_SHORTCUT_KEY.load(Ordering::Relaxed) {
-                Some(InputEvent::Manual)
+                begin_manual_capture().then_some(InputEvent::Manual {
+                    response: None,
+                    frame: input_frame_snapshot(),
+                })
             } else if ctrl && shift && event.vkCode == PAUSE_SHORTCUT_KEY.load(Ordering::Relaxed) {
                 Some(InputEvent::TogglePause)
             } else if ctrl && shift && event.vkCode == STOP_SHORTCUT_KEY.load(Ordering::Relaxed) {
                 Some(InputEvent::Stop)
             } else if !ctrl && !alt && is_typing_key(event.vkCode) {
-                Some(InputEvent::Typing)
+                Some(InputEvent::Typing {
+                    application: foreground_application_identity(),
+                    before: input_frame_snapshot(),
+                })
             } else {
                 None
             };
 
         if let Some(classified) = classified {
+            let is_manual = matches!(classified, InputEvent::Manual { .. });
+            let mut sent = false;
             if let Ok(guard) = input_sender().try_lock() {
                 if let Some(sender) = guard.as_ref() {
-                    let _ = sender.send(classified);
+                    sent = sender.send(classified).is_ok();
                 }
+            }
+            if is_manual && !sent {
+                finish_manual_capture();
             }
         }
     }
@@ -388,6 +445,7 @@ impl Default for WindowsCaptureBackend {
 
 impl Drop for WindowsCaptureBackend {
     fn drop(&mut self) {
+        finish_manual_capture();
         let _ = self.stop_active_capture();
     }
 }
@@ -518,11 +576,13 @@ impl CaptureBackend for WindowsCaptureBackend {
             project_id: Some(project_id.clone()),
             target: Some(target.clone()),
             step_count,
+            session_step_count: 0,
             elapsed_ms: 0,
             message: None,
         };
         *self.state.lock() = snapshot.clone();
         self.paused.store(false, Ordering::Relaxed);
+        finish_manual_capture();
         self.started_at = Some(Instant::now());
         MANUAL_SHORTCUT_KEY.store(options.manual_shortcut_key, Ordering::Relaxed);
         PAUSE_SHORTCUT_KEY.store(options.pause_shortcut_key, Ordering::Relaxed);
@@ -534,6 +594,10 @@ impl CaptureBackend for WindowsCaptureBackend {
             .lock()
             .map_err(|_| RecorderError::Platform("Input hook lock failed".into()))? =
             Some(input_tx.clone());
+        *input_capture_shared()
+            .lock()
+            .map_err(|_| RecorderError::Platform("Capture snapshot lock failed".into()))? =
+            Some(Arc::clone(&self.shared));
         self.input_tx = Some(input_tx);
 
         let state = Arc::clone(&self.state);
@@ -591,31 +655,49 @@ impl CaptureBackend for WindowsCaptureBackend {
         Ok(self.snapshot())
     }
 
-    fn manual_capture(&mut self) -> RecorderResult<()> {
-        self.input_tx
-            .as_ref()
-            .ok_or(RecorderError::NoTarget)?
-            .send(InputEvent::Manual)
-            .map_err(|_| RecorderError::Platform("Recording worker is unavailable".into()))
+    fn manual_capture(&mut self) -> RecorderResult<RecordingStateSnapshot> {
+        if self.paused.load(Ordering::Relaxed) {
+            return Err(RecorderError::Platform("Recording is paused".into()));
+        }
+        if !begin_manual_capture() {
+            return Ok(self.snapshot());
+        }
+        let sender = self.input_tx.as_ref().ok_or_else(|| {
+            finish_manual_capture();
+            RecorderError::NoTarget
+        })?;
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        if sender
+            .send(InputEvent::Manual {
+                response: Some(response_tx),
+                frame: latest_frame(&self.shared),
+            })
+            .is_err()
+        {
+            finish_manual_capture();
+            return Err(RecorderError::Platform(
+                "Recording worker is unavailable".into(),
+            ));
+        }
+        response_rx
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| RecorderError::Platform("Manual capture timed out".into()))?
+            .map_err(RecorderError::Platform)?;
+        Ok(self.snapshot())
     }
 
-    fn undo_last(&mut self, storage: &StorageService) -> RecorderResult<()> {
-        let project_id = self
-            .state
-            .lock()
-            .project_id
-            .clone()
-            .ok_or(RecorderError::NoTarget)?;
-        let mut project = storage
-            .load_session(&project_id)
-            .map_err(|error| RecorderError::Platform(error.to_string()))?;
-        project.steps.pop();
-        project.updated_at = chrono::Utc::now().to_rfc3339();
-        storage
-            .autosave(&project)
-            .map_err(|error| RecorderError::Platform(error.to_string()))?;
-        self.state.lock().step_count = project.steps.len();
-        Ok(())
+    fn undo_last(&mut self) -> RecorderResult<()> {
+        let sender = self.input_tx.as_ref().ok_or(RecorderError::NoTarget)?;
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        sender
+            .send(InputEvent::Undo {
+                response: response_tx,
+            })
+            .map_err(|_| RecorderError::Platform("Recording worker is unavailable".into()))?;
+        response_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| RecorderError::Platform("Recording Undo timed out".into()))?
+            .map_err(RecorderError::Platform)
     }
 
     fn stop(&mut self) -> RecorderResult<RecordingStateSnapshot> {
@@ -627,9 +709,13 @@ impl CaptureBackend for WindowsCaptureBackend {
             .as_ref()
             .map(|sender| sender.send(InputEvent::Stop));
         self.paused.store(false, Ordering::Relaxed);
+        finish_manual_capture();
         self.input_tx = None;
         if let Ok(mut sender) = input_sender().lock() {
             *sender = None;
+        }
+        if let Ok(mut shared) = input_capture_shared().lock() {
+            *shared = None;
         }
         *self.state.lock() = RecordingStateSnapshot {
             status: RecordingStatus::Idle,
@@ -879,6 +965,8 @@ fn poll_mouse_input(
                         y: point.y,
                         right,
                         at: Instant::now(),
+                        application: application_at_point(point.x, point.y),
+                        before: latest_frame(&shared),
                     })
                     .is_err()
                 {
@@ -932,6 +1020,7 @@ fn process_events(
             recoverable_error(
                 &app,
                 &state,
+                &paused,
                 "The selected target closed. Your completed steps are safe.",
             );
             break;
@@ -952,6 +1041,7 @@ fn process_events(
                     &target,
                     &shared,
                     &state,
+                    &paused,
                 );
                 schedule_application_icon_enrichment(
                     app.clone(),
@@ -962,6 +1052,9 @@ fn process_events(
                 shared.stop.store(true, Ordering::Relaxed);
                 if let Ok(mut sender) = input_sender().lock() {
                     *sender = None;
+                }
+                if let Ok(mut capture) = input_capture_shared().lock() {
+                    *capture = None;
                 }
                 {
                     let mut snapshot = state.lock();
@@ -987,8 +1080,7 @@ fn process_events(
                 };
                 emit_state(&app, &state);
             }
-            Ok(_) if paused.load(Ordering::Relaxed) => {}
-            Ok(InputEvent::Manual) => {
+            Ok(InputEvent::Undo { response }) => {
                 finalize_typing(
                     &mut typing,
                     &app,
@@ -999,34 +1091,77 @@ fn process_events(
                     &target,
                     &shared,
                     &state,
+                    &paused,
                 );
-                let Some(frame) = latest_frame(&shared) else {
-                    recoverable_error(&app, &state, "No capture frame is available.");
-                    continue;
-                };
-                let mut step = Step::manual(String::new());
-                step.instruction = if options.instruction_locale == "de" {
-                    "Beschreibe diesen Schritt".into()
-                } else {
-                    "Describe this step".into()
-                };
-                let application = foreground_application();
-                remember_application(&application, &mut application_processes);
-                step.application = application.name;
-                step.application_icon_asset = None;
-                match persist_frame(&storage, &project_id, &source, &target, &frame, None) {
-                    Ok(asset) => {
-                        step.media.before_asset = Some(asset);
-                        append_step(&app, &storage, &project_id, step, &state);
+                let result = undo_last_session_step(&storage, &project_id, &state).map(|project| {
+                    if let Some(project) = project {
+                        let _ = app.emit("recording://project-updated", &project);
+                        emit_state(&app, &state);
                     }
-                    Err(error) => recoverable_error(
-                        &app,
-                        &state,
-                        &format!("The screenshot could not be saved: {error}"),
-                    ),
+                });
+                let _ = response.send(result);
+            }
+            Ok(InputEvent::Manual { response, .. }) if paused.load(Ordering::Relaxed) => {
+                finish_manual_capture();
+                if let Some(response) = response {
+                    let _ = response.send(Err("Recording is paused".into()));
                 }
             }
-            Ok(InputEvent::Click { x, y, right, at }) => {
+            Ok(_) if paused.load(Ordering::Relaxed) => {}
+            Ok(InputEvent::Manual { response, frame }) => {
+                finalize_typing(
+                    &mut typing,
+                    &app,
+                    &storage,
+                    &project_id,
+                    &options,
+                    &source,
+                    &target,
+                    &shared,
+                    &state,
+                    &paused,
+                );
+                let result = match frame.or_else(|| latest_frame(&shared)) {
+                    Some(frame) => {
+                        let mut step = Step::manual(String::new());
+                        step.instruction = if options.instruction_locale == "de" {
+                            "Beschreibe diesen Schritt".into()
+                        } else {
+                            "Describe this step".into()
+                        };
+                        step.application = None;
+                        step.application_icon_asset = None;
+                        match persist_frame(&storage, &project_id, &source, &target, &frame, None) {
+                            Ok(asset) => {
+                                step.media.before_asset = Some(asset);
+                                append_step(&app, &storage, &project_id, step, &state, &paused)
+                            }
+                            Err(error) => {
+                                let message = format!("The screenshot could not be saved: {error}");
+                                recoverable_error(&app, &state, &paused, &message);
+                                Err(message)
+                            }
+                        }
+                    }
+                    None => {
+                        let message = "No capture frame is available.".to_string();
+                        recoverable_error(&app, &state, &paused, &message);
+                        Err(message)
+                    }
+                };
+                finish_manual_capture();
+                if let Some(response) = response {
+                    let _ = response.send(result);
+                }
+            }
+            Ok(InputEvent::Click {
+                x,
+                y,
+                right,
+                at,
+                application,
+                before,
+            }) => {
                 if last_click.as_ref().is_some_and(
                     |(previous_at, previous_x, previous_y, previous_right)| {
                         instant_distance(at, *previous_at) < Duration::from_millis(40)
@@ -1048,17 +1183,18 @@ fn process_events(
                     &target,
                     &shared,
                     &state,
+                    &paused,
                 );
                 if !should_capture_click(&target.bounds, x, y, right, &options) {
                     continue;
                 }
-                if point_belongs_to_crumbtrail(x, y) {
+                if application_is_crumbtrail(application) {
                     continue;
                 }
-                let Some(before) = latest_frame(&shared) else {
+                let Some(before) = before.or_else(|| latest_frame(&shared)) else {
                     continue;
                 };
-                let application = foreground_application();
+                let application = application_from_identity(application);
                 remember_application(&application, &mut application_processes);
                 let control = inspect_point_with_timeout(x, y, target.bounds);
                 let after = stable_after(&shared, &before, &options);
@@ -1093,6 +1229,7 @@ fn process_events(
                     recoverable_error(
                         &app,
                         &state,
+                        &paused,
                         &format!("The screenshot could not be saved: {error}"),
                     );
                     continue;
@@ -1121,7 +1258,7 @@ fn process_events(
                         })
                     })
                     .flatten();
-                append_step(
+                let _ = append_step(
                     &app,
                     &storage,
                     &project_id,
@@ -1134,6 +1271,7 @@ fn process_events(
                         included: true,
                         application: application.name,
                         application_icon_asset: None,
+                        show_icon: true,
                         control,
                         media: StepMedia {
                             before_asset,
@@ -1144,9 +1282,13 @@ fn process_events(
                         focus_zoom,
                     },
                     &state,
+                    &paused,
                 );
             }
-            Ok(InputEvent::Typing) if options.capture_typing_groups => {
+            Ok(InputEvent::Typing {
+                application,
+                before,
+            }) if options.capture_typing_groups => {
                 let focused = inspect_focused_with_timeout(target.bounds);
                 if focused.is_none() && !foreground_belongs_to_target(native, &target) {
                     continue;
@@ -1169,11 +1311,12 @@ fn process_events(
                         &target,
                         &shared,
                         &state,
+                        &paused,
                     );
                 }
                 if typing.is_none() {
-                    if let Some(before) = latest_frame(&shared) {
-                        let application = foreground_application();
+                    if let Some(before) = before.or_else(|| latest_frame(&shared)) {
+                        let application = application_from_identity(application);
                         remember_application(&application, &mut application_processes);
                         typing = Some(TypingGroup {
                             before,
@@ -1187,7 +1330,7 @@ fn process_events(
                     group.last_event = Instant::now();
                 }
             }
-            Ok(InputEvent::Typing) => {}
+            Ok(InputEvent::Typing { .. }) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if typing.as_ref().is_some_and(|group| {
                     group.last_event.elapsed() >= Duration::from_millis(options.typing_idle_ms)
@@ -1202,6 +1345,7 @@ fn process_events(
                         &target,
                         &shared,
                         &state,
+                        &paused,
                     );
                 }
             }
@@ -1288,6 +1432,7 @@ fn finalize_typing(
     target: &CaptureTargetDescriptor,
     shared: &CaptureShared,
     state: &Arc<Mutex<RecordingStateSnapshot>>,
+    paused: &AtomicBool,
 ) {
     let Some(group) = group.take() else { return };
     let after = stable_after(shared, &group.before, options);
@@ -1323,6 +1468,7 @@ fn finalize_typing(
         recoverable_error(
             app,
             state,
+            paused,
             &format!("The screenshot could not be saved: {error}"),
         );
         return;
@@ -1343,7 +1489,7 @@ fn finalize_typing(
                 .map(|annotation| focus_rect(annotation.rect, options.default_focus_zoom_percent))
         })
         .flatten();
-    append_step(
+    let _ = append_step(
         app,
         storage,
         project_id,
@@ -1356,6 +1502,7 @@ fn finalize_typing(
             included: true,
             application: group.application.name,
             application_icon_asset: None,
+            show_icon: true,
             control: group.control,
             media: StepMedia {
                 before_asset,
@@ -1366,6 +1513,7 @@ fn finalize_typing(
             focus_zoom,
         },
         state,
+        paused,
     );
 }
 
@@ -1374,22 +1522,44 @@ struct ForegroundApplication {
     process_id: u32,
 }
 
-fn foreground_application() -> ForegroundApplication {
-    let Ok(window) = Window::foreground() else {
-        return ForegroundApplication {
-            name: None,
-            process_id: 0,
-        };
-    };
-    let name = window.process_name().ok();
+fn application_at_point(x: i32, y: i32) -> ApplicationIdentity {
+    let window = unsafe { WindowFromPoint(POINT { x, y }) };
+    if window.is_invalid() {
+        return ApplicationIdentity::default();
+    }
+    let root = unsafe { GetAncestor(window, GA_ROOT) };
+    application_identity(if root.is_invalid() { window } else { root })
+}
+
+fn foreground_application_identity() -> ApplicationIdentity {
+    application_identity(unsafe { GetForegroundWindow() })
+}
+
+fn application_identity(window: HWND) -> ApplicationIdentity {
+    if window.is_invalid() {
+        return ApplicationIdentity::default();
+    }
     let mut process_id = 0;
-    unsafe {
-        GetWindowThreadProcessId(
-            windows::Win32::Foundation::HWND(window.as_raw_hwnd()),
-            Some(&mut process_id),
-        )
-    };
-    ForegroundApplication { name, process_id }
+    unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
+    ApplicationIdentity {
+        window: window.0 as isize,
+        process_id,
+    }
+}
+
+fn application_from_identity(identity: ApplicationIdentity) -> ForegroundApplication {
+    let name = (identity.window != 0)
+        .then(|| Window::from_raw_hwnd(identity.window as *mut std::ffi::c_void))
+        .filter(|window| window.process_id().ok() == Some(identity.process_id))
+        .and_then(|window| window.process_name().ok());
+    ForegroundApplication {
+        name,
+        process_id: identity.process_id,
+    }
+}
+
+fn application_is_crumbtrail(identity: ApplicationIdentity) -> bool {
+    identity.process_id != 0 && identity.process_id == std::process::id()
 }
 
 fn remember_application(
@@ -1716,22 +1886,29 @@ fn persist_frame(
     frame: &FrameSnapshot,
     redaction: Option<&Annotation>,
 ) -> Result<String, String> {
-    let image = RgbaImage::from_raw(frame.width, frame.height, frame.rgba.clone())
+    let image = RgbaImage::from_raw(frame.width, frame.height, frame.rgba.as_ref().clone())
         .ok_or_else(|| "Invalid frame buffer".to_string())?;
     let x = target.bounds.x.saturating_sub(source.bounds.x).max(0) as u32;
     let y = target.bounds.y.saturating_sub(source.bounds.y).max(0) as u32;
     let width = target.bounds.width.min(frame.width.saturating_sub(x));
     let height = target.bounds.height.min(frame.height.saturating_sub(y));
-    let cropped = DynamicImage::ImageRgba8(image).crop_imm(x, y, width, height);
-    let mut cursor = Cursor::new(Vec::new());
-    cropped
-        .write_to(&mut cursor, ImageFormat::Png)
+    let cropped = DynamicImage::ImageRgba8(image)
+        .crop_imm(x, y, width, height)
+        .to_rgba8();
+    let mut bytes = Vec::new();
+    PngEncoder::new_with_quality(&mut bytes, CompressionType::Fast, FilterType::Sub)
+        .write_image(
+            cropped.as_raw(),
+            cropped.width(),
+            cropped.height(),
+            ExtendedColorType::Rgba8,
+        )
         .map_err(|error| error.to_string())?;
     let bytes = if let Some(redaction) = redaction {
-        render_annotated_png(cursor.get_ref(), std::slice::from_ref(redaction))
+        render_annotated_png(&bytes, std::slice::from_ref(redaction))
             .map_err(|error| error.to_string())?
     } else {
-        cursor.into_inner()
+        bytes
     };
     storage
         .write_asset(project_id, &format!("step-{}.png", Uuid::new_v4()), &bytes)
@@ -1797,15 +1974,25 @@ fn append_step(
     project_id: &str,
     step: Step,
     state: &Arc<Mutex<RecordingStateSnapshot>>,
-) {
+    paused: &AtomicBool,
+) -> Result<(), String> {
     let result = persist_step(storage, project_id, step, state);
     match result {
         Ok((step, project)) => {
             let _ = app.emit("recording://step-created", &step);
             let _ = app.emit("recording://project-updated", &project);
             emit_state(app, state);
+            Ok(())
         }
-        Err(error) => recoverable_error(app, state, &format!("A step could not be saved: {error}")),
+        Err(error) => {
+            recoverable_error(
+                app,
+                state,
+                paused,
+                &format!("A step could not be saved: {error}"),
+            );
+            Err(error.to_string())
+        }
     }
 }
 
@@ -1824,8 +2011,39 @@ fn persist_step(
     storage
         .autosave(&project)
         .map_err(|error| error.to_string())?;
-    state.lock().step_count = project.steps.len();
+    {
+        let mut snapshot = state.lock();
+        snapshot.step_count = project.steps.len();
+        snapshot.session_step_count += 1;
+    }
     Ok((step, project))
+}
+
+fn undo_last_session_step(
+    storage: &StorageService,
+    project_id: &str,
+    state: &Arc<Mutex<RecordingStateSnapshot>>,
+) -> Result<Option<ProjectManifest>, String> {
+    if state.lock().session_step_count == 0 {
+        return Ok(None);
+    }
+
+    let mut project = storage
+        .load_session(project_id)
+        .map_err(|error| error.to_string())?;
+    if project.steps.pop().is_none() {
+        return Err("The recording step list is unexpectedly empty".into());
+    }
+    project.updated_at = chrono::Utc::now().to_rfc3339();
+    storage
+        .autosave(&project)
+        .map_err(|error| error.to_string())?;
+    {
+        let mut snapshot = state.lock();
+        snapshot.step_count = project.steps.len();
+        snapshot.session_step_count = snapshot.session_step_count.saturating_sub(1);
+    }
+    Ok(Some(project))
 }
 
 fn maybe_name_project_from_step(project: &mut ProjectManifest, step: &Step) {
@@ -1872,19 +2090,109 @@ fn emit_state(app: &AppHandle, state: &Arc<Mutex<RecordingStateSnapshot>>) {
     let _ = app.emit("recording://state", state.lock().clone());
 }
 
-fn recoverable_error(app: &AppHandle, state: &Arc<Mutex<RecordingStateSnapshot>>, message: &str) {
+fn recoverable_error(
+    app: &AppHandle,
+    state: &Arc<Mutex<RecordingStateSnapshot>>,
+    paused: &AtomicBool,
+    message: &str,
+) {
+    pause_after_error(state, paused, message);
+    let _ = app.emit("recording://recoverable-error", message);
+    emit_state(app, state);
+}
+
+fn pause_after_error(
+    state: &Arc<Mutex<RecordingStateSnapshot>>,
+    paused: &AtomicBool,
+    message: &str,
+) {
+    paused.store(true, Ordering::Relaxed);
     {
         let mut snapshot = state.lock();
         snapshot.status = RecordingStatus::Paused;
         snapshot.message = Some(message.into());
     }
-    let _ = app.emit("recording://recoverable-error", message);
-    emit_state(app, state);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recoverable_errors_pause_processing_and_visible_state_together() {
+        let paused = AtomicBool::new(false);
+        let state = Arc::new(Mutex::new(RecordingStateSnapshot {
+            status: RecordingStatus::Recording,
+            ..RecordingStateSnapshot::default()
+        }));
+
+        pause_after_error(&state, &paused, "Capture failed");
+
+        assert!(paused.load(Ordering::Relaxed));
+        assert_eq!(state.lock().status, RecordingStatus::Paused);
+        assert_eq!(state.lock().message.as_deref(), Some("Capture failed"));
+    }
+
+    #[test]
+    fn manual_capture_gate_coalesces_requests_until_the_current_save_finishes() {
+        finish_manual_capture();
+
+        assert!(begin_manual_capture());
+        assert!(!begin_manual_capture());
+
+        finish_manual_capture();
+        assert!(begin_manual_capture());
+        finish_manual_capture();
+    }
+
+    #[test]
+    fn click_event_keeps_application_and_frame_from_the_click_moment() {
+        let clicked_application = ApplicationIdentity {
+            window: 123,
+            process_id: 456,
+        };
+        let shared = CaptureShared::default();
+        *shared.latest.lock() = Some(FrameSnapshot {
+            rgba: Arc::new(vec![1, 2, 3, 4]),
+            width: 1,
+            height: 1,
+            sequence: 1,
+        });
+        let event = InputEvent::Click {
+            x: 100,
+            y: 200,
+            right: false,
+            at: Instant::now(),
+            application: clicked_application,
+            before: latest_frame(&shared),
+        };
+        shared.latest.lock().as_mut().unwrap().sequence = 2;
+
+        let InputEvent::Click {
+            application,
+            before,
+            ..
+        } = event
+        else {
+            panic!("expected a click event");
+        };
+        assert_eq!(application, clicked_application);
+        assert_eq!(before.unwrap().sequence, 1);
+    }
+
+    #[test]
+    fn crumbtrail_hud_click_stays_internal_after_the_hud_closes() {
+        let hud_click = ApplicationIdentity {
+            window: 123,
+            process_id: std::process::id(),
+        };
+
+        assert!(application_is_crumbtrail(hud_click));
+        assert!(!application_is_crumbtrail(ApplicationIdentity {
+            window: 456,
+            process_id: std::process::id() + 1,
+        }));
+    }
 
     #[test]
     fn unsupported_optional_capture_settings_are_retryable() {
@@ -2106,14 +2414,14 @@ mod tests {
     #[test]
     fn visual_stability_uses_sampled_pixels() {
         let frame = FrameSnapshot {
-            rgba: vec![12; 400],
+            rgba: Arc::new(vec![12; 400]),
             width: 10,
             height: 10,
             sequence: 1,
         };
         assert_eq!(visual_difference(&frame, &frame), 0.0);
         let changed = FrameSnapshot {
-            rgba: vec![255; 400],
+            rgba: Arc::new(vec![255; 400]),
             sequence: 2,
             ..frame.clone()
         };
@@ -2139,7 +2447,7 @@ mod tests {
             scale_factor: 1.0,
         };
         let frame = FrameSnapshot {
-            rgba: vec![255; 16],
+            rgba: Arc::new(vec![255; 16]),
             width: 2,
             height: 2,
             sequence: 1,
@@ -2159,6 +2467,43 @@ mod tests {
         assert_eq!(saved.steps.len(), 1);
         assert_eq!(saved.title, "Notepad Guide");
         assert_eq!(state.lock().step_count, 1);
+    }
+
+    #[test]
+    fn recording_undo_never_removes_a_step_from_an_earlier_session() {
+        let temporary = tempfile::tempdir().unwrap();
+        let storage = StorageService::new(temporary.path().to_path_buf()).unwrap();
+        let mut project = storage.create_project("Existing guide").unwrap();
+        let mut previous_step = Step::manual(String::new());
+        previous_step.instruction = "Existing step".into();
+        previous_step.media.before_asset = None;
+        project.steps.push(previous_step.clone());
+        storage.autosave(&project).unwrap();
+        let state = Arc::new(Mutex::new(RecordingStateSnapshot {
+            step_count: 1,
+            ..RecordingStateSnapshot::default()
+        }));
+
+        assert!(undo_last_session_step(&storage, &project.id, &state)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            storage.load_session(&project.id).unwrap().steps,
+            vec![previous_step.clone()]
+        );
+
+        let mut new_step = Step::manual(String::new());
+        new_step.instruction = "New recording step".into();
+        new_step.media.before_asset = None;
+        persist_step(&storage, &project.id, new_step, &state).unwrap();
+        assert_eq!(state.lock().session_step_count, 1);
+
+        let updated = undo_last_session_step(&storage, &project.id, &state)
+            .unwrap()
+            .expect("the current session step should be removed");
+        assert_eq!(updated.steps, vec![previous_step]);
+        assert_eq!(state.lock().step_count, 1);
+        assert_eq!(state.lock().session_step_count, 0);
     }
 
     #[test]

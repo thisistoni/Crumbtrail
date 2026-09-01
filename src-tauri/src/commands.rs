@@ -62,6 +62,16 @@ pub fn delete_session(state: State<'_, AppState>, id: String) -> Result<(), Stri
 }
 
 #[tauri::command]
+pub fn restore_session(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.storage.restore_session(&id).map_err(message)
+}
+
+#[tauri::command]
+pub fn compact_session(state: State<'_, AppState>, id: String) -> Result<usize, String> {
+    state.storage.compact_session(&id).map_err(message)
+}
+
+#[tauri::command]
 pub fn open_project(state: State<'_, AppState>, source: String) -> Result<ProjectManifest, String> {
     state
         .storage
@@ -264,13 +274,13 @@ pub fn resume_recording(
 }
 
 #[tauri::command]
-pub fn capture_manual_step(state: State<'_, AppState>) -> Result<(), String> {
+pub fn capture_manual_step(state: State<'_, AppState>) -> Result<RecordingStateSnapshot, String> {
     state.recorder.manual_capture().map_err(message)
 }
 
 #[tauri::command]
 pub fn undo_recorded_step(state: State<'_, AppState>) -> Result<(), String> {
-    state.recorder.undo_last(&state.storage).map_err(message)
+    state.recorder.undo_last().map_err(message)
 }
 
 #[tauri::command]

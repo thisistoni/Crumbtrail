@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { getCurrentWindow } from "@tauri-apps/api/window"
-import { CircleStop, Pause, Play, RotateCcw, ScanLine } from "lucide-react"
+import { Camera, CircleStop, Pause, Play, RotateCcw } from "lucide-react"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
@@ -14,7 +14,9 @@ import type { RecordingStateSnapshot } from "@/types"
 export function RecordingHud() {
   const { t } = useLocale()
   const { settings } = useSettings()
-  const [state, setState] = useState<RecordingStateSnapshot>({ status: "recording", stepCount: 0, elapsedMs: 0 })
+  const [state, setState] = useState<RecordingStateSnapshot>({ status: "recording", stepCount: 0, sessionStepCount: 0, elapsedMs: 0 })
+  const [manualBaseStepCount, setManualBaseStepCount] = useState<number | null>(null)
+  const manualPending = useRef(false)
   const [localStart] = useState(Date.now())
 
   useEffect(() => {
@@ -32,8 +34,22 @@ export function RecordingHud() {
   }, [localStart])
 
   const paused = state.status === "paused"
+  const displayedStepCount = optimisticManualStepCount(state.stepCount, manualBaseStepCount)
   async function togglePause() { setState(paused ? await bridge.resume() : await bridge.pause()) }
   async function stop() { await bridge.stop(); await getCurrentWindow().close() }
+  async function manualCapture() {
+    if (paused || manualPending.current) return
+    manualPending.current = true
+    setManualBaseStepCount(state.stepCount)
+    try {
+      setState(await bridge.manual())
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      manualPending.current = false
+      setManualBaseStepCount(null)
+    }
+  }
 
   return (
     <main className="drag-region h-screen w-screen overflow-hidden rounded-[20px] bg-transparent">
@@ -42,12 +58,12 @@ export function RecordingHud() {
           <span className={`size-2.5 rounded-full ${paused ? "bg-breadcrumb" : "animate-pulse bg-red-500"}`} />
           <div><p className="text-xs font-semibold">{paused ? t("paused") : t("recording")}</p><p className="font-mono text-[11px] tabular-nums text-muted-foreground">{formatDuration(state.elapsedMs)}</p></div>
         </div>
-        <Separator orientation="vertical" className="h-8" />
-        <div className="min-w-16 text-center"><p className="text-lg font-semibold tabular-nums">{state.stepCount}</p><p className="text-[10px] uppercase tracking-wider text-muted-foreground">{t("steps")}</p></div>
-        <Separator orientation="vertical" className="h-8" />
+        <Separator orientation="vertical" data-hud-separator />
+        <div className="min-w-16 text-center"><p className="text-lg font-semibold tabular-nums">{displayedStepCount}</p><p className="text-[10px] uppercase tracking-wider text-muted-foreground">{t("steps")}</p></div>
+        <Separator orientation="vertical" data-hud-separator />
         <div className="no-drag flex items-center gap-1">
-          <HudButton label={`${t("manualCapture")} · ${shortcutLabel(settings.shortcuts.manualCapture)}`} onClick={() => bridge.manual()}><ScanLine /></HudButton>
-          <HudButton label={t("undo")} onClick={() => bridge.undoRecorded()}><RotateCcw /></HudButton>
+          <HudButton label={`${t("manualCapture")} · ${shortcutLabel(settings.shortcuts.manualCapture)}`} onClick={manualCapture} disabled={paused || manualBaseStepCount !== null}><Camera className={manualBaseStepCount !== null ? "animate-pulse" : undefined} /></HudButton>
+          <HudButton label={t("undo")} onClick={() => bridge.undoRecorded()} disabled={state.sessionStepCount === 0}><RotateCcw /></HudButton>
           <HudButton label={`${paused ? t("resume") : t("pause")} · ${shortcutLabel(settings.shortcuts.pauseResume)}`} onClick={togglePause}>{paused ? <Play /> : <Pause />}</HudButton>
         </div>
         <div className="no-drag ml-auto"><Button variant="destructive" className="h-10 rounded-xl px-3" onClick={stop} title={shortcutLabel(settings.shortcuts.stopRecording)}><CircleStop data-icon="inline-start" />{t("stop")}</Button></div>
@@ -56,8 +72,12 @@ export function RecordingHud() {
   )
 }
 
-function HudButton({ label, onClick, children }: { label: string; onClick(): void; children: React.ReactNode }) {
-  return <Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon-lg" onClick={onClick} aria-label={label} />}>{children}</TooltipTrigger><TooltipContent>{label}</TooltipContent></Tooltip>
+function HudButton({ label, onClick, disabled, children }: { label: string; onClick(): void; disabled?: boolean; children: React.ReactNode }) {
+  return <Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon-lg" onClick={onClick} disabled={disabled} aria-label={label} />}>{children}</TooltipTrigger><TooltipContent>{label}</TooltipContent></Tooltip>
+}
+
+export function optimisticManualStepCount(stepCount: number, pendingBaseStepCount: number | null) {
+  return pendingBaseStepCount !== null && stepCount <= pendingBaseStepCount ? pendingBaseStepCount + 1 : stepCount
 }
 
 function formatDuration(ms: number) {

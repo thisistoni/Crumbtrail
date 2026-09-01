@@ -37,6 +37,7 @@ export interface ThemeSettings {
   logoAsset?: string | null
   showTimestamps: boolean
   showApplicationNames: boolean
+  showIcons: boolean
   showCrumbtrailBranding: boolean
   reportLocale: AppLocale
 }
@@ -70,6 +71,7 @@ export interface Step {
   included: boolean
   application?: string | null
   applicationIconAsset?: string | null
+  showIcon?: boolean
   control?: ControlMetadata | null
   media: { beforeAsset?: string | null; afterAsset?: string | null; selected: MediaVariant }
   annotations: Annotation[]
@@ -94,6 +96,7 @@ export interface RecordingStateSnapshot {
   projectId?: string | null
   target?: CaptureTargetDescriptor | null
   stepCount: number
+  sessionStepCount: number
   elapsedMs: number
   message?: string | null
 }
